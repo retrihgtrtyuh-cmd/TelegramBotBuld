@@ -397,6 +397,7 @@ async def main():
     logger.info(f"Webhook HTTP сервер запущен на порту {PORT}")
 
     try:
+        await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
     finally:
         await runner.cleanup()

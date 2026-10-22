@@ -2,5 +2,7 @@
   "name": "APK CI/CD Telegram Bot Studio",
   "description": "Панель конфигурации, генератор кода (Python aiogram + GitHub Actions) и интерактивный симулятор Telegram-бота для автоматической сборки Android APK и резервного копирования.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
