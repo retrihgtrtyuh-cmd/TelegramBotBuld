@@ -60,7 +60,7 @@ export default function App() {
 
   // Active Navigation Section
   const [activeTab, setActiveTab] = useState<'code' | 'simulator' | 'secrets' | 'devlog' | 'concept'>('code');
-  const [selectedFile, setSelectedFile] = useState<'bot' | 'workflow' | 'env' | 'dockerfile' | 'tree'>('bot');
+  const [selectedFile, setSelectedFile] = useState<'bot' | 'requirements' | 'render' | 'workflow' | 'env' | 'dockerfile' | 'tree'>('requirements');
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
   // Simulator State
@@ -542,23 +542,58 @@ WEBHOOK_SECRET="apk_webhook_secret_key_2026"
 PORT="8080"
 DEV_LOG_PATH="../dev_log.md"`;
 
+  const requirementsCode = `aiogram==3.17.0
+python-dotenv==1.0.1
+requests==2.32.3
+aiohttp==3.11.11`;
+
+  const renderConfigCode = `# --- Файл 1: Procfile (в корне репозитория) ---
+web: python bot/main.py
+
+# --- Файл 2: render.yaml (Blueprint для автонастройки на Render) ---
+services:
+  - type: web
+    name: telegram-apk-ci-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot/main.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_IDS
+        sync: false
+      - key: GITHUB_PAT
+        sync: false
+      - key: GITHUB_OWNER
+        value: ${config.githubOwner}
+      - key: GITHUB_REPO
+        value: ${config.githubRepo}
+      - key: GITHUB_BRANCH
+        value: ${config.defaultBranch}
+      - key: WEBHOOK_SECRET
+        sync: false`;
+
   const dockerfileCode = `# Dockerfile для деплоя бота на Render / Railway / VPS
 FROM python:3.11-slim
 
 WORKDIR /srv/app
 
-# Копируем зависимости и устанавливаем их
-COPY bot/requirements.txt ./bot/requirements.txt
-RUN pip install --no-cache-dir -r ./bot/requirements.txt
+# Копируем корневой requirements.txt и устанавливаем зависимости
+COPY requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r ./requirements.txt
 
 # Копируем код бота и корневой журнал разработки dev_log.md
 COPY bot/ ./bot/
 COPY dev_log.md ./dev_log.md
 
-WORKDIR /srv/app/bot
+WORKDIR /srv/app
 EXPOSE 8080
 
-CMD ["python", "main.py"]`;
+CMD ["python", "bot/main.py"]`;
 
   const projectTreeCode = `mobile-game-project/
 ├── .github/
@@ -566,10 +601,11 @@ CMD ["python", "main.py"]`;
 │       └── android_build.yml      # Пайплайн: .tar.gz бэкап + .jks подпись + сборка APK + доставка
 ├── app/                           # Модуль Android-игры (Gradle, src/main, build.gradle.kts)
 │   └── build.gradle.kts
-├── bot/                           # Изолированный модуль Telegram-бота (для Render / Railway / VPS)
-│   ├── main.py                    # Aiogram 3.x + aiohttp веб-сервер (/build, /status, /log, /api/upload-apk)
-│   ├── requirements.txt           # aiogram==3.17.0, aiohttp==3.11.11, python-dotenv==1.0.1
-│   └── Dockerfile                 # Готовый контейнер для деплоя
+├── bot/                           # Код Telegram-бота
+│   └── main.py                    # Aiogram 3.x + python-dotenv + aiohttp веб-сервер
+├── requirements.txt               # В КОРНЕ ПРОЕКТА (чтобы Render находил его при pip install -r requirements.txt)
+├── Procfile                       # Команда запуска для Render / Railway: web: python bot/main.py
+├── render.yaml                    # Конфигурация Render Blueprint (Build & Start Commands)
 ├── .env                           # Локальные секреты (добавлен в .gitignore!)
 ├── .env.example                   # Шаблон переменных окружения
 ├── .gitignore                     # Исключает .env, *.jks, *.apk, *.tar.gz, build/
@@ -751,6 +787,10 @@ CMD ["python", "main.py"]`;
     switch (selectedFile) {
       case 'bot':
         return { filename: 'bot/main.py', lang: 'python', code: pythonBotCode };
+      case 'requirements':
+        return { filename: 'requirements.txt', lang: 'text', code: requirementsCode };
+      case 'render':
+        return { filename: 'render.yaml / Procfile', lang: 'yaml', code: renderConfigCode };
       case 'workflow':
         return { filename: '.github/workflows/android_build.yml', lang: 'yaml', code: githubWorkflowCode };
       case 'env':
@@ -964,6 +1004,16 @@ CMD ["python", "main.py"]`;
 
                 <div className="space-y-1.5">
                   {[
+                    {
+                      id: 'requirements',
+                      title: 'requirements.txt (в корне)',
+                      desc: 'aiogram, python-dotenv, requests, aiohttp',
+                    },
+                    {
+                      id: 'render',
+                      title: 'Procfile и render.yaml',
+                      desc: 'Конфигурация сборки и запуска на Render',
+                    },
                     {
                       id: 'bot',
                       title: 'bot/main.py',
