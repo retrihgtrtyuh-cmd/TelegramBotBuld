@@ -542,21 +542,28 @@ WEBHOOK_SECRET="apk_webhook_secret_key_2026"
 PORT="8080"
 DEV_LOG_PATH="../dev_log.md"`;
 
-  const requirementsCode = `aiogram==3.17.0
+  const requirementsCode = `--only-binary=:all:
+aiogram==3.15.0
+pydantic==2.9.2
+pydantic-core==2.23.4
 python-dotenv==1.0.1
 requests==2.32.3
-aiohttp==3.11.11`;
+aiohttp==3.10.11`;
 
-  const renderConfigCode = `# --- Файл 1: Procfile (в корне репозитория) ---
+  const renderConfigCode = `# --- Файл 1: .python-version (в корне репозитория) ---
+# Фиксирует Python 3.11.9 на Render, чтобы pydantic-core ставился из готового .whl без компиляции Rust
+3.11.9
+
+# --- Файл 2: Procfile (в корне репозитория) ---
 web: python bot/main.py
 
-# --- Файл 2: render.yaml (Blueprint для автонастройки на Render) ---
+# --- Файл 3: render.yaml (Blueprint для автонастройки на Render) ---
 services:
   - type: web
     name: telegram-apk-ci-bot
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install --upgrade pip && pip install --only-binary=:all: -r requirements.txt
     startCommand: python bot/main.py
     healthCheckPath: /health
     envVars:
