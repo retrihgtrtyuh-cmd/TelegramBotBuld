@@ -5,20 +5,22 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot/main.py
-    healthCheckPath: /health
+    healthCheckPath: /
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_IDS
-        sync: false
+        value: "-1003962969725"
       - key: GITHUB_PAT
         sync: false
       - key: GITHUB_OWNER
-        sync: false
+        value: retrihgtrtyuh-cmd
       - key: GITHUB_REPO
-        sync: false
+        value: xianxia-sect-maneger
+      - key: GITHUB_WORKFLOW
+        value: build-apk.yml
       - key: GITHUB_BRANCH
         value: main
       - key: WEBHOOK_SECRET

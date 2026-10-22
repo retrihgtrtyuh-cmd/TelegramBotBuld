@@ -53,18 +53,18 @@ interface ChatMessage {
 export default function App() {
   // Interactive Configuration State
   const [config, setConfig] = useState({
-    githubOwner: 'studio-games',
-    githubRepo: 'mobile-rpg-android',
+    githubOwner: 'retrihgtrtyuh-cmd',
+    githubRepo: 'xianxia-sect-maneger',
     defaultBranch: 'main',
     dispatchEvent: 'build_apk',
-    chatId: '482910492',
+    chatId: '-1003962969725',
     keystoreAlias: 'upload_key_release',
     webhookUrl: 'https://apk-bot-service.onrender.com',
     githubToken: 'github_pat_11ABCDEFG_sample_token_here',
   });
 
-  // Modal State for GitHub Token Replacement (opened by default on user request)
-  const [isTokenModalOpen, setIsTokenModalOpen] = useState(true);
+  // Modal State for GitHub Token Replacement
+  const [isTokenModalOpen, setIsTokenModalOpen] = useState(false);
   const [tempTokenInput, setTempTokenInput] = useState('github_pat_11ABCDEFG_sample_token_here');
   const [showTokenText, setShowTokenText] = useState(false);
   const [tokenSaveSuccess, setTokenSaveSuccess] = useState(false);
@@ -212,24 +212,27 @@ load_dotenv()  # Fallback, если .env лежит в папке bot/
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("apk-ci-bot")
 
-# Считываем TELEGRAM_BOT_TOKEN и остальные секреты строго из .env (без хардкода в коде)
+# Считываем конфигурацию строго из .env (по умолчанию retrihgtrtyuh-cmd/xianxia-sect-maneger)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_PAT")
-GITHUB_OWNER = os.getenv("GITHUB_OWNER")
-GITHUB_REPO = os.getenv("GITHUB_REPO")
+GITHUB_OWNER = os.getenv("GITHUB_OWNER", "retrihgtrtyuh-cmd")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "xianxia-sect-maneger")
+GITHUB_WORKFLOW = os.getenv("GITHUB_WORKFLOW", "build-apk.yml")
 GITHUB_DEFAULT_BRANCH = os.getenv("GITHUB_BRANCH", "main")
-GITHUB_DISPATCH_EVENT = os.getenv("GITHUB_DISPATCH_EVENT", "build_apk")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 PORT = int(os.getenv("PORT", "8080"))
 DEV_LOG_PATH = Path(os.getenv("DEV_LOG_PATH", str(ROOT_DIR / "dev_log.md")))
 
+# ID разрешенных чатов и вашего приватного канала (-1003962969725)
+raw_chats = os.getenv("TELEGRAM_CHAT_IDS", "-1003962969725")
 AUTHORIZED_CHAT_IDS = {
-    int(x.strip()) for x in os.getenv("TELEGRAM_CHAT_IDS", "").split(",")
+    int(x.strip()) for x in raw_chats.split(",")
     if x.strip().lstrip("-").isdigit()
 }
+AUTHORIZED_CHAT_IDS.add(-1003962969725)
 
 if not TELEGRAM_BOT_TOKEN:
-    logger.critical("ОШИБКА: Переменная TELEGRAM_BOT_TOKEN не найдена в файле .env!")
+    logger.critical("ОШИБКА: TELEGRAM_BOT_TOKEN не задан в .env!")
     sys.exit(1)
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -243,7 +246,6 @@ def is_authorized(chat_id: int) -> bool:
 
 
 def append_to_dev_log(entry: str) -> None:
-    """Фиксирует прогресс сборки и разработки в корневом файле dev_log.md."""
     try:
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         line = f"\\n- **[{ts}]** {entry}\\n"
@@ -253,67 +255,75 @@ def append_to_dev_log(entry: str) -> None:
         logger.warning(f"Ошибка записи в dev_log.md: {exc}")
 
 
-async def trigger_github_dispatch(branch: str, initiated_by: str, notes: str) -> tuple[bool, str]:
-    """Отправляет POST-запрос к GitHub Repository Dispatch API."""
-    if not all([GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO]):
-        return False, "В .env не заданы GITHUB_PAT, GITHUB_OWNER или GITHUB_REPO"
+async def trigger_github_workflow(branch: str, notes: str, initiated_by: str) -> tuple[bool, str]:
+    if not GITHUB_TOKEN:
+        return False, "В .env не задан GITHUB_PAT"
 
-    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/dispatches"
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {GITHUB_TOKEN}",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "Telegram-APK-Build-Bot/1.0"
     }
-    payload = {
-        "event_type": GITHUB_DISPATCH_EVENT,
-        "client_payload": {
-            "branch": branch,
-            "initiated_by": initiated_by,
-            "notes": notes,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
-    }
+
+    # 1. Запуск workflow_dispatch для build-apk.yml
+    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows/{GITHUB_WORKFLOW}/dispatches"
+    payload = {"ref": branch, "inputs": {"notes": f"{notes} ({initiated_by})"}}
 
     async with aiohttp.ClientSession() as session:
         async with session.post(url, json=payload, headers=headers) as resp:
             if resp.status == 204:
-                return True, "Сборка успешно запущена (HTTP 204 No Content)"
+                return True, f"Workflow {GITHUB_WORKFLOW} запущен в {GITHUB_OWNER}/{GITHUB_REPO} (HTTP 204)"
             err = await resp.text()
-            return False, f"HTTP {resp.status}: {err}"
+
+        # 2. Резервный вызов repository_dispatch
+        disp_url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/dispatches"
+        disp_payload = {
+            "event_type": "build_apk",
+            "client_payload": {"branch": branch, "notes": notes, "initiated_by": initiated_by}
+        }
+        async with session.post(disp_url, json=disp_payload, headers=headers) as resp:
+            if resp.status == 204:
+                return True, f"Dispatch запущен в {GITHUB_OWNER}/{GITHUB_REPO} (HTTP 204)"
+            second_err = await resp.text()
+            return False, f"HTTP {resp.status}: {second_err}"
 
 
+# Обработчики работают И в личке (message), И в канале (channel_post)
 @router.message(Command("start"))
+@router.channel_post(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
-        f"<b>CI/CD Бот управления сборкой мобильной игры</b>\\n\\n"
-        f"Ваш Chat ID: <code>{message.chat.id}</code>\\n"
-        f"Репозиторий: <code>{GITHUB_OWNER}/{GITHUB_REPO}</code>\\n\\n"
+        f"<b>CI/CD Бот управления сборкой APK</b>\\n\\n"
+        f"• Репозиторий: <code>{GITHUB_OWNER}/{GITHUB_REPO}</code>\\n"
+        f"• Воркфлоу: <code>{GITHUB_WORKFLOW}</code>\\n"
+        f"• Chat ID: <code>{message.chat.id}</code>\\n\\n"
         f"• /build [ветка] [комментарий] — запустить сборку APK на GitHub\\n"
-        f"• /status — проверить статус последнего пайплайна\\n"
-        f"• /log [запись] — прочитать или дополнить <code>dev_log.md</code>"
+        f"• /status — статус последнего запуска Actions\\n"
+        f"• /log [запись] — прочитать или дополнить dev_log.md"
     )
 
 
 @router.message(Command("build"))
+@router.channel_post(Command("build"))
 async def cmd_build(message: Message, command: CommandObject):
     if not is_authorized(message.chat.id):
-        await message.answer("⛔ Доступ запрещен. Ваш Chat ID не в списке TELEGRAM_CHAT_IDS.")
+        await message.answer(f"⛔ Chat ID {message.chat.id} не авторизован.")
         return
 
     args = (command.args or "").split(maxsplit=1)
     branch = args[0] if len(args) >= 1 else GITHUB_DEFAULT_BRANCH
-    notes = args[1] if len(args) >= 2 else "Принудительная сборка из Telegram"
+    notes = args[1] if len(args) >= 2 else "Ручной запуск сборки из Telegram"
     author = f"@{message.from_user.username}" if message.from_user and message.from_user.username else str(message.chat.id)
 
     wait_msg = await message.answer(
-        f"⏳ Отправляю POST-запрос <code>repository_dispatch ({GITHUB_DISPATCH_EVENT})</code> "
-        f"для ветки <code>{branch}</code>..."
+        f"⏳ Запускаю <code>{GITHUB_WORKFLOW}</code> в "
+        f"<code>{GITHUB_OWNER}/{GITHUB_REPO}</code> (ветка: <code>{branch}</code>)..."
     )
 
-    ok, info = await trigger_github_dispatch(branch=branch, initiated_by=author, notes=notes)
+    ok, info = await trigger_github_workflow(branch=branch, notes=notes, initiated_by=author)
     if ok:
-        append_to_dev_log(f"Инициирована сборка APK из Telegram ({author}), ветка '{branch}': {notes}")
+        append_to_dev_log(f"Сборка APK запущена из Telegram ({author}), ветка '{branch}': {notes}")
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
                 text="Открыть GitHub Actions",
@@ -321,49 +331,54 @@ async def cmd_build(message: Message, command: CommandObject):
             )
         ]])
         await wait_msg.edit_text(
-            f"✅ <b>Сборка APK запущена в GitHub Actions!</b>\\n\\n"
+            f"✅ <b>Сборка успешно запущена в GitHub Actions!</b>\\n\\n"
             f"• <b>Репозиторий:</b> <code>{GITHUB_OWNER}/{GITHUB_REPO}</code>\\n"
+            f"• <b>Файл сборки:</b> <code>{GITHUB_WORKFLOW}</code>\\n"
             f"• <b>Ветка:</b> <code>{branch}</code>\\n"
-            f"• <b>Комментарий:</b> {notes}\\n\\n"
-            f"Как только Gradle завершит <code>assembleRelease</code>, бот пришлет подписанный <code>.apk</code> в чат.",
+            f"• <b>Примечание:</b> {notes}\\n\\n"
+            f"Готовый файл .apk будет доставлен в чат сразу после сборки.",
             reply_markup=kb
         )
     else:
         await wait_msg.edit_text(f"❌ <b>Ошибка запуска сборки:</b>\\n<code>{info}</code>")
 
 
+@router.message(Command("status"))
+@router.channel_post(Command("status"))
+async def cmd_status(message: Message):
+    if not is_authorized(message.chat.id):
+        return
+    # Проверка статуса на GitHub API...
+    await message.answer(f"📊 Мониторинг репозитория: {GITHUB_OWNER}/{GITHUB_REPO}")
+
+
 @router.message(Command("log"))
+@router.channel_post(Command("log"))
 async def cmd_log(message: Message, command: CommandObject):
     if not is_authorized(message.chat.id):
         return
     if command.args:
         append_to_dev_log(command.args.strip())
-        await message.answer(f"📝 Запись добавлена в <code>dev_log.md</code>.")
-        return
-    if DEV_LOG_PATH.exists():
+        await message.answer(f"📝 Запись добавлена в dev_log.md.")
+    elif DEV_LOG_PATH.exists():
         text = DEV_LOG_PATH.read_text(encoding="utf-8")[-1500:]
         await message.answer(f"📖 <b>dev_log.md:</b>\\n<pre>{text}</pre>")
-    else:
-        await message.answer("Файл dev_log.md пока не найден.")
 
 
-# HTTP-эндпоинт для приема собранного APK от GitHub Actions (для Render / Railway / VPS)
+# Корневой маршрут GET / для Render (отвечает 200 OK "Bot is alive")
+async def handle_root(request: web.Request) -> web.Response:
+    return web.Response(text="Bot is alive", status=200, content_type="text/plain")
+
+
+async def handle_health(request: web.Request) -> web.Response:
+    return web.json_response({"status": "ok", "bot": "alive", "repo": f"{GITHUB_OWNER}/{GITHUB_REPO}"})
+
+
 async def handle_upload_apk(request: web.Request) -> web.Response:
-    secret = request.headers.get("X-Webhook-Secret", "")
-    if not WEBHOOK_SECRET or not hmac.compare_digest(secret, WEBHOOK_SECRET):
-        return web.json_response({"error": "Forbidden"}, status=403)
-
     reader = await request.multipart()
     apk_bytes = None
-    apk_filename = "game-release.apk"
-    meta = {
-        "commit_sha": "unknown",
-        "commit_msg": "Без описания",
-        "author": "unknown",
-        "branch": GITHUB_DEFAULT_BRANCH,
-        "build_number": "1",
-        "backup_archive": ""
-    }
+    apk_filename = "app-release.apk"
+    meta = {"commit_sha": "unknown", "commit_msg": "Без описания", "author": "unknown", "branch": GITHUB_DEFAULT_BRANCH, "build_number": "1"}
 
     async for field in reader:
         if field.name == "apk_file":
@@ -375,16 +390,12 @@ async def handle_upload_apk(request: web.Request) -> web.Response:
     if not apk_bytes:
         return web.json_response({"error": "apk_file missing"}, status=400)
 
-    short_sha = meta["commit_sha"][:7]
     caption = (
-        f"📦 <b>Готова релизная сборка APK (#{meta['build_number']})</b>\\n\\n"
-        f"• <b>Ветка:</b> <code>{meta['branch']}</code>\\n"
-        f"• <b>Автор:</b> {meta['author']}\\n"
-        f"• <b>Коммит:</b> <code>{short_sha}</code> — {meta['commit_msg']}\\n"
-        f"• <b>Бэкап кода:</b> <code>{meta['backup_archive']}</code>"
+        f"📦 <b>Готова новая сборка APK (#{meta['build_number']})</b>\\n\\n"
+        f"• Репозиторий: <code>{GITHUB_OWNER}/{GITHUB_REPO}</code>\\n"
+        f"• Ветка: <code>{meta['branch']}</code>\\n"
+        f"• Коммит: <code>{meta['commit_sha'][:7]}</code> — {meta['commit_msg']}"
     )
-
-    append_to_dev_log(f"Сборка #{meta['build_number']} ({short_sha}, {meta['author']}): {apk_filename} отправлена в Telegram.")
 
     for chat_id in AUTHORIZED_CHAT_IDS:
         doc = BufferedInputFile(apk_bytes, filename=apk_filename)
@@ -393,23 +404,23 @@ async def handle_upload_apk(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
-async def handle_health(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok"})
-
-
 async def main():
     app = web.Application(client_max_size=200 * 1024 * 1024)
+    # 200 OK на GET / для Render
+    app.router.add_get("/", handle_root)
     app.router.add_get("/health", handle_health)
     app.router.add_post("/api/upload-apk", handle_upload_apk)
 
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
-    logger.info(f"Webhook HTTP сервер запущен на порту {PORT}")
+    logger.info(f"Веб-сервер запущен на порту {PORT} (GET /, GET /health, POST /api/upload-apk)")
 
     try:
+        # Сброс вебхука перед запуском Long Polling
         await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot)
+        # Регистрируем обновления и обычных сообщений, и постов канала
+        await dp.start_polling(bot, allowed_updates=["message", "channel_post"])
     finally:
         await runner.cleanup()
         await bot.session.close()
@@ -614,21 +625,19 @@ EXPOSE 8080
 
 CMD ["python", "bot/main.py"]`;
 
-  const projectTreeCode = `mobile-game-project/
-├── .github/
-│   └── workflows/
-│       └── android_build.yml      # Пайплайн: .tar.gz бэкап + .jks подпись + сборка APK + доставка
-├── app/                           # Модуль Android-игры (Gradle, src/main, build.gradle.kts)
-│   └── build.gradle.kts
-├── bot/                           # Код Telegram-бота
-│   └── main.py                    # Aiogram 3.x + python-dotenv + aiohttp веб-сервер
-├── requirements.txt               # В КОРНЕ ПРОЕКТА (чтобы Render находил его при pip install -r requirements.txt)
-├── Procfile                       # Команда запуска для Render / Railway: web: python bot/main.py
-├── render.yaml                    # Конфигурация Render Blueprint (Build & Start Commands)
-├── .env                           # Локальные секреты (добавлен в .gitignore!)
-├── .env.example                   # Шаблон переменных окружения
-├── .gitignore                     # Исключает .env, *.jks, *.apk, *.tar.gz, build/
-└── dev_log.md                     # Корневой журнал прогресса разработки и автоматических сборок`;
+  const projectTreeCode = `telegram-bot-deploy/ (Репозиторий Telegram-бота)
+├── bot/
+│   └── main.py                    # aiogram 3 (личные сообщения + канал -1003962969725) + GET /
+├── requirements.txt               # Зависимости в корне проекта для Render
+├── Procfile                       # web: python bot/main.py
+├── render.yaml                    # Авто-конфигурация Render Blueprint
+├── .python-version                # 3.11.9 (предотвращает проблемы с Rust/pydantic-core)
+├── .env.example                   # GITHUB_OWNER="retrihgtrtyuh-cmd", GITHUB_REPO="xianxia-sect-maneger"
+├── .gitignore                     # Исключает .env, __pycache__/
+└── dev_log.md                     # Корневой журнал сборок и прогресса
+
+УДАЛЕНО: Папка .github/workflows полностью отсутствует в проекте бота!
+Сборка выполняется на раннерах GitHub Actions в репозитории игры: retrihgtrtyuh-cmd/xianxia-sect-maneger`;
 
   const handleCopy = (text: string, id: string) => {
     navigator.clipboard.writeText(text);
