@@ -7,8 +7,16 @@ from pathlib import Path
 
 import aiohttp
 from aiohttp import web
-from aiogram import Bot, Dispatcher, Router
-from aiogram.types import Message, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import (
+    Message,
+    BufferedInputFile,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    CallbackQuery
+)
 from aiogram.filters import Command, CommandObject
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
@@ -133,49 +141,64 @@ async def trigger_github_workflow(
 
 
 # =====================================================================
-# ОБРАБОТЧИКИ КОМАНД (И ДЛЯ ЛИЧНЫХ СООБЩЕНИЙ, И ДЛЯ ПОСТОВ В КАНАЛЕ)
+# КЛАВИАТУРЫ (КРАСИВЫЕ КНОПКИ ДЛЯ КОМАНД)
 # =====================================================================
 
-@router.message(Command("start"))
-@router.channel_post(Command("start"))
-async def cmd_start(message: Message):
-    chat_id = message.chat.id
-    auth_status = "Доступ разрешен" if is_authorized(chat_id) else "Нет в списке разрешенных"
-    await message.answer(
-        f"<b>CI/CD Бот управления сборкой APK</b>\n\n"
-        f"• <b>Целевой репозиторий:</b> <code>{GITHUB_OWNER}/{GITHUB_REPO}</code>\n"
-        f"• <b>Воркфлоу:</b> <code>{GITHUB_WORKFLOW}</code>\n"
-        f"• <b>Текущий Chat ID:</b> <code>{chat_id}</code> ({auth_status})\n\n"
-        f"<b>Доступные команды:</b>\n"
-        f"• <code>/build</code> [ветка] [комментарий] — запустить сборку APK на GitHub\n"
-        f"• <code>/status</code> — статус последнего запуска Actions\n"
-        f"• <code>/log</code> [запись] — прочитать или дополнить <code>dev_log.md</code>"
+def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
+    """Постоянная нижняя клавиатура с красивыми кнопками."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="🚀 Собрать APK (main)"),
+                KeyboardButton(text="📊 Статус CI/CD"),
+            ],
+            [
+                KeyboardButton(text="📖 Журнал сборок (log)"),
+                KeyboardButton(text="ℹ️ О репозитории"),
+            ]
+        ],
+        resize_keyboard=True,
+        is_persistent=True
     )
 
 
-@router.message(Command("build"))
-@router.channel_post(Command("build"))
-async def cmd_build(message: Message, command: CommandObject):
-    chat_id = message.chat.id
+def get_start_inline_keyboard() -> InlineKeyboardMarkup:
+    """Инлайн-кнопки прямо под сообщением."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🚀 Запустить сборку APK", callback_data="cb_build"),
+                InlineKeyboardButton(text="📊 Статус Actions", callback_data="cb_status"),
+            ],
+            [
+                InlineKeyboardButton(text="📖 Журнал dev_log.md", callback_data="cb_log"),
+                InlineKeyboardButton(
+                    text="🌐 GitHub Actions",
+                    url=f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/actions"
+                ),
+            ]
+        ]
+    )
+
+
+async def perform_build(chat_id: int, sender_label: str, branch: str, notes: str, reply_to_message: Message = None):
+    """Выполняет запуск сборки APK и отправляет статус с кнопкой перехода на GitHub."""
     if not is_authorized(chat_id):
-        await message.answer(f"⛔ Chat ID <code>{chat_id}</code> не авторизован для запуска сборки.")
+        text = f"⛔ Chat ID <code>{chat_id}</code> не авторизован для запуска сборки."
+        if reply_to_message:
+            await reply_to_message.answer(text)
+        else:
+            await bot.send_message(chat_id, text)
         return
 
-    args = (command.args or "").split(maxsplit=1)
-    branch = args[0] if len(args) >= 1 else GITHUB_DEFAULT_BRANCH
-    notes = args[1] if len(args) >= 2 else "Ручной запуск сборки из Telegram"
-
-    sender_label = (
-        f"@{message.from_user.username}"
-        if message.from_user and message.from_user.username
-        else f"Канал ({chat_id})" if message.chat.type == "channel"
-        else str(chat_id)
-    )
-
-    status_msg = await message.answer(
+    init_text = (
         f"⏳ Запускаю воркфлоу <code>{GITHUB_WORKFLOW}</code> в репозитории "
         f"<code>{GITHUB_OWNER}/{GITHUB_REPO}</code> (ветка: <code>{branch}</code>)..."
     )
+    if reply_to_message:
+        status_msg = await reply_to_message.answer(init_text)
+    else:
+        status_msg = await bot.send_message(chat_id, init_text)
 
     success, details = await trigger_github_workflow(
         branch=branch,
@@ -187,7 +210,7 @@ async def cmd_build(message: Message, command: CommandObject):
         append_to_dev_log(f"Сборка APK запущена из {sender_label}, ветка `{branch}`: {notes}")
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
-                text="Открыть GitHub Actions",
+                text="🌐 Открыть GitHub Actions",
                 url=f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/actions"
             )
         ]])
@@ -205,16 +228,10 @@ async def cmd_build(message: Message, command: CommandObject):
         await status_msg.edit_text(f"❌ <b>Ошибка запуска сборки:</b>\n<code>{details}</code>")
 
 
-@router.message(Command("status"))
-@router.channel_post(Command("status"))
-async def cmd_status(message: Message):
-    if not is_authorized(message.chat.id):
-        await message.answer("⛔ Доступ запрещен.")
-        return
-
+async def get_status_text() -> tuple[str, InlineKeyboardMarkup | None]:
+    """Запрашивает статус последнего запуска на GitHub Actions."""
     if not GITHUB_TOKEN:
-        await message.answer("⚠️ В .env не задан GITHUB_PAT.")
-        return
+        return "⚠️ В .env не задан GITHUB_PAT.", None
 
     url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/runs?per_page=1"
     headers = {
@@ -227,25 +244,98 @@ async def cmd_status(message: Message):
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers) as resp:
             if resp.status != 200:
-                await message.answer(f"⚠️ Не удалось получить статус (HTTP {resp.status}).")
-                return
+                return f"⚠️ Не удалось получить статус (HTTP {resp.status}).", None
             data = await resp.json()
 
     runs = data.get("workflow_runs", [])
     if not runs:
-        await message.answer(f"Сборок в репозитории <code>{GITHUB_OWNER}/{GITHUB_REPO}</code> пока не найдено.")
-        return
+        return f"Сборок в репозитории <code>{GITHUB_OWNER}/{GITHUB_REPO}</code> пока не найдено.", None
 
     latest = runs[0]
-    await message.answer(
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="🌐 Открыть на GitHub",
+            url=latest.get("html_url", f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/actions")
+        ),
+        InlineKeyboardButton(text="🔄 Обновить", callback_data="cb_status")
+    ]])
+    text = (
         f"📊 <b>Статус последнего запуска CI/CD:</b>\n\n"
         f"• <b>Репозиторий:</b> <code>{GITHUB_OWNER}/{GITHUB_REPO}</code>\n"
         f"• <b>Workflow:</b> {latest.get('name')}\n"
         f"• <b>Статус:</b> <code>{latest.get('status')}</code> ({latest.get('conclusion') or 'в процессе'})\n"
         f"• <b>Ветка:</b> <code>{latest.get('head_branch')}</code>\n"
         f"• <b>Коммит:</b> <code>{latest.get('head_sha', '')[:7]}</code>\n"
-        f"• <b>Ссылка:</b> {latest.get('html_url')}"
+        f"• <b>Время:</b> {latest.get('created_at', '')[:19].replace('T', ' ')} UTC"
     )
+    return text, kb
+
+
+def get_log_text() -> str:
+    """Возвращает хвост файла dev_log.md."""
+    if not DEV_LOG_PATH.exists():
+        return "Файл <code>dev_log.md</code> пока не найден."
+    content = DEV_LOG_PATH.read_text(encoding="utf-8")
+    tail = content[-1500:] if len(content) > 1500 else content
+    return f"📖 <b>Последние записи из dev_log.md:</b>\n\n<pre>{tail}</pre>"
+
+
+# =====================================================================
+# ОБРАБОТЧИКИ КОМАНД, ТЕКСТОВЫХ КНОПОК И ИНЛАЙН-КНОПОК
+# =====================================================================
+
+@router.message(Command("start"))
+@router.channel_post(Command("start"))
+async def cmd_start(message: Message):
+    chat_id = message.chat.id
+    auth_status = "Доступ разрешен" if is_authorized(chat_id) else "Нет в списке разрешенных"
+    await message.answer(
+        f"<b>CI/CD Панель управления сборкой APK</b>\n\n"
+        f"• <b>Целевой репозиторий:</b> <code>{GITHUB_OWNER}/{GITHUB_REPO}</code>\n"
+        f"• <b>Воркфлоу:</b> <code>{GITHUB_WORKFLOW}</code>\n"
+        f"• <b>Текущий Chat ID:</b> <code>{chat_id}</code> ({auth_status})\n\n"
+        f"Используйте кнопки ниже для быстрого управления:",
+        reply_markup=get_start_inline_keyboard()
+    )
+    # Включаем нижнюю клавиатуру кнопок для удобного клика в 1 касание
+    if message.chat.type != "channel":
+        await message.answer(
+            "Меню быстрых команд активировано 👇",
+            reply_markup=get_main_reply_keyboard()
+        )
+
+
+@router.message(Command("build"))
+@router.channel_post(Command("build"))
+async def cmd_build(message: Message, command: CommandObject):
+    args = (command.args or "").split(maxsplit=1)
+    branch = args[0] if len(args) >= 1 else GITHUB_DEFAULT_BRANCH
+    notes = args[1] if len(args) >= 2 else "Ручной запуск сборки из Telegram"
+
+    sender_label = (
+        f"@{message.from_user.username}"
+        if message.from_user and message.from_user.username
+        else f"Канал ({message.chat.id})" if message.chat.type == "channel"
+        else str(message.chat.id)
+    )
+    await perform_build(message.chat.id, sender_label, branch, notes, reply_to_message=message)
+
+
+@router.message(F.text == "🚀 Собрать APK (main)")
+async def reply_btn_build(message: Message):
+    sender_label = f"@{message.from_user.username}" if message.from_user and message.from_user.username else str(message.chat.id)
+    await perform_build(message.chat.id, sender_label, GITHUB_DEFAULT_BRANCH, "Запуск через кнопку меню", reply_to_message=message)
+
+
+@router.message(Command("status"))
+@router.channel_post(Command("status"))
+@router.message(F.text == "📊 Статус CI/CD")
+async def cmd_status(message: Message):
+    if not is_authorized(message.chat.id):
+        await message.answer("⛔ Доступ запрещен.")
+        return
+    text, kb = await get_status_text()
+    await message.answer(text, reply_markup=kb)
 
 
 @router.message(Command("log"))
@@ -259,12 +349,55 @@ async def cmd_log(message: Message, command: CommandObject):
         await message.answer(f"📝 Запись добавлена в <code>dev_log.md</code>.")
         return
 
-    if DEV_LOG_PATH.exists():
-        content = DEV_LOG_PATH.read_text(encoding="utf-8")
-        tail = content[-1500:] if len(content) > 1500 else content
-        await message.answer(f"📖 <b>dev_log.md:</b>\n<pre>{tail}</pre>")
-    else:
-        await message.answer("Файл dev_log.md пока не найден.")
+    await message.answer(get_log_text())
+
+
+@router.message(F.text == "📖 Журнал сборок (log)")
+async def reply_btn_log(message: Message):
+    if not is_authorized(message.chat.id):
+        return
+    await message.answer(get_log_text())
+
+
+@router.message(F.text == "ℹ️ О репозитории")
+async def reply_btn_info(message: Message):
+    chat_id = message.chat.id
+    auth_status = "Доступ разрешен" if is_authorized(chat_id) else "Нет в списке разрешенных"
+    await message.answer(
+        f"ℹ️ <b>Информация о сборке:</b>\n\n"
+        f"• <b>Репозиторий:</b> <code>{GITHUB_OWNER}/{GITHUB_REPO}</code>\n"
+        f"• <b>Файл воркфлоу:</b> <code>{GITHUB_WORKFLOW}</code>\n"
+        f"• <b>Ветка:</b> <code>{GITHUB_DEFAULT_BRANCH}</code>\n"
+        f"• <b>Ваш Chat ID:</b> <code>{chat_id}</code> ({auth_status})",
+        reply_markup=get_start_inline_keyboard()
+    )
+
+
+# ---------------------------------------------------------------------
+# ОБРАБОТЧИКИ НАЖАТИЙ НА ИНЛАЙН-КНОПКИ (CALLBACKS)
+# ---------------------------------------------------------------------
+
+@router.callback_query(F.data == "cb_build")
+async def callback_build(call: CallbackQuery):
+    await call.answer()
+    sender_label = f"@{call.from_user.username}" if call.from_user and call.from_user.username else str(call.message.chat.id)
+    await perform_build(call.message.chat.id, sender_label, GITHUB_DEFAULT_BRANCH, "Запуск через инлайн-кнопку", reply_to_message=call.message)
+
+
+@router.callback_query(F.data == "cb_status")
+async def callback_status(call: CallbackQuery):
+    await call.answer("Запрашиваю статус...")
+    text, kb = await get_status_text()
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "cb_log")
+async def callback_log(call: CallbackQuery):
+    await call.answer()
+    await call.message.answer(get_log_text())
 
 
 # =====================================================================
