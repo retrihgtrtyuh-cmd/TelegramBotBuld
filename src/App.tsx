@@ -71,7 +71,7 @@ export default function App() {
 
   // Active Navigation Section
   const [activeTab, setActiveTab] = useState<'code' | 'simulator' | 'secrets' | 'devlog' | 'concept'>('code');
-  const [selectedFile, setSelectedFile] = useState<'bot' | 'requirements' | 'render' | 'workflow' | 'env' | 'dockerfile' | 'tree'>('requirements');
+  const [selectedFile, setSelectedFile] = useState<'build-apk' | 'bot' | 'requirements' | 'render' | 'workflow' | 'env' | 'dockerfile' | 'tree'>('build-apk');
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
   // Simulator State
@@ -802,8 +802,102 @@ CMD ["python", "bot/main.py"]`;
     setNewLogText('');
   };
 
+  const buildApkWorkflowCode = `name: Build & Send APK to Telegram
+
+on:
+  # Ручной запуск (из веб-интерфейса GitHub или через GitHub API / Telegram-бота)
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: 'Комментарий к сборке'
+        required: false
+        default: 'Ручной запуск сборки APK'
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Клонирование репозитория
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Настройка рабочей среды Java (JDK 17)
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      # 3. Настройка Android SDK
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      # 4. Предоставление прав на исполнение скрипту Gradle Wrapper
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      # 5. Сборка APK с помощью Gradle (assembleRelease)
+      - name: Build APK with Gradle
+        run: ./gradlew assembleRelease
+
+      # 6. Поиск собранного файла APK и сбор метаданных коммита
+      - name: Locate compiled APK
+        id: locate_apk
+        run: |
+          APK_FILE=$(find . -path "*/build/outputs/apk/*" -name "*.apk" | head -n 1)
+          if [ -z "$APK_FILE" ]; then
+            echo "::error::APK файл не найден в директориях build/outputs/apk/"
+            exit 1
+          fi
+          echo "Found APK: $APK_FILE"
+          echo "apk_path=$APK_FILE" >> $GITHUB_OUTPUT
+          
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          COMMIT_MSG=$(git log -1 --pretty=format:'%s')
+          AUTHOR=$(git log -1 --pretty=format:'%an')
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "commit_msg=$COMMIT_MSG" >> $GITHUB_OUTPUT
+          echo "author=$AUTHOR" >> $GITHUB_OUTPUT
+
+      # 7. Отправка готового APK в Telegram-чат через Telegram Bot API (sendDocument)
+      - name: Send APK to Telegram
+        if: success()
+        env:
+          TELEGRAM_BOT_TOKEN: \${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: \${{ secrets.TELEGRAM_CHAT_ID }}
+          APK_PATH: \${{ steps.locate_apk.outputs.apk_path }}
+          SHORT_SHA: \${{ steps.locate_apk.outputs.short_sha }}
+          COMMIT_MSG: \${{ steps.locate_apk.outputs.commit_msg }}
+          AUTHOR: \${{ steps.locate_apk.outputs.author }}
+          RUN_NUM: \${{ github.run_number }}
+          NOTES: \${{ github.event.inputs.notes || 'Сборка через GitHub Actions' }}
+        run: |
+          CAPTION="📦 <b>Новая сборка APK (#\${RUN_NUM}) готова!</b>%0A%0A• <b>Ветка:</b> <code>\${{ github.ref_name }}</code>%0A• <b>Коммит:</b> <code>\${SHORT_SHA}</code> — \${COMMIT_MSG}%0A• <b>Автор:</b> \${AUTHOR}%0A• <b>Примечание:</b> \${NOTES}"
+
+          RESPONSE=\$(curl -s -w "\\n%{http_code}" -X POST "https://api.telegram.org/bot\${TELEGRAM_BOT_TOKEN}/sendDocument" \\
+            -F "chat_id=\${TELEGRAM_CHAT_ID}" \\
+            -F "parse_mode=HTML" \\
+            -F "caption=\${CAPTION}" \\
+            -F "document=@\${APK_PATH}")
+
+          HTTP_CODE=\$(echo "$RESPONSE" | tail -n 1)
+          BODY=\$(echo "$RESPONSE" | sed '$d')
+
+          echo "Telegram API Response HTTP code: $HTTP_CODE"
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "::error::Не удалось отправить файл в Telegram. Ответ: $BODY"
+            exit 1
+          else
+            echo "APK успешно отправлен в Telegram!"
+          fi`;
+
   const getSelectedCodeContent = () => {
     switch (selectedFile) {
+      case 'build-apk':
+        return { filename: '.github/workflows/build-apk.yml', lang: 'yaml', code: buildApkWorkflowCode };
       case 'bot':
         return { filename: 'bot/main.py', lang: 'python', code: pythonBotCode };
       case 'requirements':
@@ -1034,6 +1128,11 @@ CMD ["python", "bot/main.py"]`;
 
                 <div className="space-y-1.5">
                   {[
+                    {
+                      id: 'build-apk',
+                      title: '.github/workflows/build-apk.yml',
+                      desc: 'Сборка Gradle + прямая отправка APK в Telegram',
+                    },
                     {
                       id: 'requirements',
                       title: 'requirements.txt (в корне)',
