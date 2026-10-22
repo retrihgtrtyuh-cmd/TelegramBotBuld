@@ -14,7 +14,11 @@ import {
   RefreshCw,
   FolderGit2,
   ExternalLink,
-  Plus
+  Plus,
+  Eye,
+  EyeOff,
+  X,
+  Key
 } from 'lucide-react';
 
 interface BuildRun {
@@ -56,7 +60,14 @@ export default function App() {
     chatId: '482910492',
     keystoreAlias: 'upload_key_release',
     webhookUrl: 'https://apk-bot-service.onrender.com',
+    githubToken: 'github_pat_11ABCDEFG_sample_token_here',
   });
+
+  // Modal State for GitHub Token Replacement (opened by default on user request)
+  const [isTokenModalOpen, setIsTokenModalOpen] = useState(true);
+  const [tempTokenInput, setTempTokenInput] = useState('github_pat_11ABCDEFG_sample_token_here');
+  const [showTokenText, setShowTokenText] = useState(false);
+  const [tokenSaveSuccess, setTokenSaveSuccess] = useState(false);
 
   // Active Navigation Section
   const [activeTab, setActiveTab] = useState<'code' | 'simulator' | 'secrets' | 'devlog' | 'concept'>('code');
@@ -529,7 +540,7 @@ TELEGRAM_BOT_TOKEN="7123456789:AAH_your_bot_token_here"
 TELEGRAM_CHAT_IDS="${config.chatId}"
 
 # 3. GitHub Personal Access Token (Fine-grained Token с правами Contents: R/W и Actions: R/W)
-GITHUB_PAT="github_pat_11ABCDEFG_your_token_here"
+GITHUB_PAT="${config.githubToken}"
 
 # 4. Параметры целевого репозитория с игрой
 GITHUB_OWNER="${config.githubOwner}"
@@ -871,6 +882,17 @@ CMD ["python", "bot/main.py"]`;
         </nav>
 
         <div className="flex items-center gap-3 shrink-0">
+          <button
+            onClick={() => {
+              setTempTokenInput(config.githubToken);
+              setTokenSaveSuccess(false);
+              setIsTokenModalOpen(true);
+            }}
+            className="px-3 py-2 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
+          >
+            <KeyRound className="w-3.5 h-3.5 text-sky-400" />
+            Заменить токен GitHub
+          </button>
           <button
             onClick={() => {
               setActiveTab('simulator');
@@ -1654,13 +1676,141 @@ CMD ["python", "bot/main.py"]`;
         )}
       </main>
 
-      {/* Quiet Footer */}
-      <footer className="border-t border-slate-800/80 py-5 px-6 mt-auto">
-        <div className="max-w-[1400px] mx-auto flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-slate-500">
-          <span>Инфраструктура автоматизации сборки Android APK · GitHub Actions + Python Aiogram 3.x</span>
-          <span>Файлы сохранены в проекте: /bot/main.py · /.github/workflows/android_build.yml · /dev_log.md</span>
+      {/* Interactive Modal: Замена токена GitHub */}
+      {isTokenModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-xs">
+          <div className="bg-[#111827] border border-slate-700/80 rounded-2xl w-full max-w-xl p-6 shadow-2xl space-y-6">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <div className="flex items-center gap-2 text-xs text-sky-400 font-medium">
+                  <KeyRound className="w-4 h-4" />
+                  <span>GitHub Personal Access Token (PAT)</span>
+                </div>
+                <h2 className="text-lg font-bold text-white mt-1">Окно замены токена GitHub</h2>
+                <p className="text-xs text-slate-400 mt-1">
+                  Токен используется ботом для запуска сборки APK через <code className="text-slate-200">repository_dispatch</code> на серверах GitHub Actions.
+                </p>
+              </div>
+              <button
+                onClick={() => setIsTokenModalOpen(false)}
+                className="text-slate-400 hover:text-white p-1 rounded-lg transition-colors cursor-pointer"
+                title="Закрыть"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-200 mb-1.5">
+                  Новый токен GitHub (переменная GITHUB_PAT в .env):
+                </label>
+                <div className="relative">
+                  <input
+                    type={showTokenText ? 'text' : 'password'}
+                    value={tempTokenInput}
+                    onChange={(e) => {
+                      setTempTokenInput(e.target.value);
+                      setTokenSaveSuccess(false);
+                    }}
+                    placeholder="github_pat_11A... или ghp_..."
+                    className="w-full px-3.5 py-2.5 pr-10 text-xs font-mono bg-[#0B0F17] border border-slate-700 rounded-lg text-slate-100 focus:outline-none focus:border-sky-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowTokenText(!showTokenText)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200 cursor-pointer"
+                    title={showTokenText ? 'Скрыть токен' : 'Показать токен'}
+                  >
+                    {showTokenText ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+                <div className="flex items-center justify-between text-[11px] text-slate-400 mt-1.5">
+                  <span>
+                    {tempTokenInput.startsWith('github_pat_')
+                      ? '✓ Формат: Fine-grained Personal Access Token'
+                      : tempTokenInput.startsWith('ghp_')
+                      ? '✓ Формат: Classic Personal Access Token'
+                      : 'Токен обычно начинается с github_pat_ или ghp_'}
+                  </span>
+                  <span className="font-mono tabular-nums">{tempTokenInput.length} символов</span>
+                </div>
+              </div>
+
+              {/* Инструкция по созданию токена с прямым переходом */}
+              <div className="p-3.5 rounded-lg bg-[#0B0F17] border border-slate-800 space-y-2 text-xs">
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-slate-200">Необходимые права (Permissions) токена:</span>
+                  <a
+                    href="https://github.com/settings/tokens?type=beta"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-sky-400 hover:text-sky-300 flex items-center gap-1 font-medium"
+                  >
+                    Создать токен на GitHub <ExternalLink className="w-3 h-3" />
+                  </a>
+                </div>
+                <ul className="space-y-1 text-slate-400 text-[11px]">
+                  <li className="flex items-center gap-1.5">
+                    <Check className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    <span><strong>Contents: Read and write</strong> (для вызова dispatches и чтения коммитов)</span>
+                  </li>
+                  <li className="flex items-center gap-1.5">
+                    <Check className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    <span><strong>Actions: Read and write</strong> (для удаленного запуска пайплайнов)</span>
+                  </li>
+                  <li className="flex items-center gap-1.5">
+                    <Check className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    <span><strong>Metadata: Read-only</strong> (выбирается автоматически)</span>
+                  </li>
+                </ul>
+              </div>
+
+              {tokenSaveSuccess && (
+                <div className="p-3 rounded-lg bg-emerald-950/40 border border-emerald-800/60 text-xs text-emerald-300 flex items-center gap-2">
+                  <Check className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <span>Токен успешно сохранен в конфигурации проекта и обновлен в шаблоне .env!</span>
+                </div>
+              )}
+            </div>
+
+            <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-2 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={() => {
+                  const line = `GITHUB_PAT="${tempTokenInput}"`;
+                  handleCopy(line, 'modal-pat');
+                }}
+                className="w-full sm:w-auto px-3.5 py-2 text-xs font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+              >
+                {copiedId === 'modal-pat' ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                {copiedId === 'modal-pat' ? 'Скопировано!' : 'Скопировать строку для .env'}
+              </button>
+
+              <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
+                <button
+                  type="button"
+                  onClick={() => setIsTokenModalOpen(false)}
+                  className="px-4 py-2 text-xs font-medium text-slate-400 hover:text-white rounded-lg transition-colors cursor-pointer"
+                >
+                  Закрыть
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setConfig({ ...config, githubToken: tempTokenInput.trim() });
+                    setTokenSaveSuccess(true);
+                  }}
+                  className="px-4 py-2 text-xs font-semibold text-slate-950 bg-sky-400 hover:bg-sky-300 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  Сохранить токен
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
-      </footer>
+      )}
     </div>
   );
 }
