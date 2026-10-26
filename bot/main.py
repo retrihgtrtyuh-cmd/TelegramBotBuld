@@ -263,8 +263,12 @@ jobs:
             echo "::error::Файл APK не найден в build/outputs/apk/"
             exit 1
           fi
-          echo "apk_path=$APK_FILE" >> $GITHUB_OUTPUT
-          echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          RENAMED_APK="${{ github.event.repository.name }}_v${{ github.run_number }}_${SHORT_SHA}.apk"
+          cp "$APK_FILE" "./$RENAMED_APK"
+          echo "apk_path=./$RENAMED_APK" >> $GITHUB_OUTPUT
+          echo "apk_filename=$RENAMED_APK" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
           echo "commit_msg=$(git log -1 --pretty=format:'%s')" >> $GITHUB_OUTPUT
           echo "author=$(git log -1 --pretty=format:'%an')" >> $GITHUB_OUTPUT
 
@@ -273,22 +277,27 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          RUN_NUM: ${{ github.run_number }}
           APK_PATH: ${{ steps.locate_apk.outputs.apk_path }}
           SHORT_SHA: ${{ steps.locate_apk.outputs.short_sha }}
           COMMIT_MSG: ${{ steps.locate_apk.outputs.commit_msg }}
           AUTHOR: ${{ steps.locate_apk.outputs.author }}
-          RUN_NUM: ${{ github.run_number }}
         run: |
-          CAPTION="📦 <b>Сборка APK (#${RUN_NUM}) готова!</b>%0A%0A• <b>Проект:</b> <code>${{ github.repository }}</code>%0A• <b>Ветка:</b> <code>${{ github.ref_name }}</code>%0A• <b>Коммит:</b> <code>${SHORT_SHA}</code> — ${COMMIT_MSG}%0A• <b>Автор:</b> ${AUTHOR}"
+          RENAMED_APK="${REPO_NAME}_v${RUN_NUM}_${SHORT_SHA}.apk"
+          if [ "$APK_PATH" != "./$RENAMED_APK" ] && [ -f "$APK_PATH" ]; then
+            cp "$APK_PATH" "./$RENAMED_APK"
+          fi
+          CAPTION="📦 <b>Сборка APK готова!</b>%0A%0A• <b>Проект:</b> <code>${REPO_NAME}</code>%0A• <b>Номер сборки:</b> <code>#${RUN_NUM}</code> (<code>v${RUN_NUM}</code>)%0A• <b>Файл:</b> <code>${RENAMED_APK}</code>%0A• <b>Ветка:</b> <code>${{ github.ref_name }}</code>%0A• <b>Коммит:</b> <code>${SHORT_SHA}</code> — ${COMMIT_MSG}%0A• <b>Автор:</b> ${AUTHOR}"
           curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \\
             -F "chat_id=${TELEGRAM_CHAT_ID}" \\
             -F "parse_mode=HTML" \\
             -F "caption=${CAPTION}" \\
-            -F "document=@${APK_PATH}"
+            -F "document=@./${RENAMED_APK}"
 
-      - name: Cleanup Keystore
+      - name: Cleanup Keystore & Temp APK
         if: always()
-        run: rm -f app/release-key.jks
+        run: rm -f app/release-key.jks ./*_v*_*.apk
 """
 
 
@@ -1809,8 +1818,9 @@ async def handle_upload_apk(request: web.Request) -> web.Response:
 
     reader = await request.multipart()
     apk_bytes = None
-    apk_filename = "app-release.apk"
+    apk_filename = ""
     meta = {
+        "repo_name": cfg.get("github_repo", "xianxia-sect-maneger"),
         "commit_sha": "unknown",
         "commit_msg": "Без описания",
         "author": "unknown",
@@ -1820,7 +1830,7 @@ async def handle_upload_apk(request: web.Request) -> web.Response:
 
     async for field in reader:
         if field.name == "apk_file":
-            apk_filename = field.filename or apk_filename
+            apk_filename = field.filename or ""
             apk_bytes = await field.read()
         elif field.name in meta:
             meta[field.name] = (await field.read(decode=True)).decode("utf-8", errors="replace")
@@ -1828,12 +1838,20 @@ async def handle_upload_apk(request: web.Request) -> web.Response:
     if not apk_bytes:
         return web.json_response({"error": "apk_file missing"}, status=400)
 
+    short_sha = meta["commit_sha"][:7]
+    repo_name = meta["repo_name"] or cfg.get("github_repo", "xianxia-sect-maneger")
+    build_num = meta["build_number"]
+    if not apk_filename or apk_filename == "app-release.apk":
+        apk_filename = f"{repo_name}_v{build_num}_{short_sha}.apk"
+
     caption = (
-        f"📦 <b>Готова новая сборка APK (#{meta['build_number']})</b>\n\n"
-        f"• <b>Репозиторий:</b> <code>{cfg.get('github_owner')}/{cfg.get('github_repo')}</code>\n"
+        f"📦 <b>Сборка APK готова!</b>\n\n"
+        f"• <b>Проект:</b> <code>{repo_name}</code>\n"
+        f"• <b>Номер сборки:</b> <code>#{build_num}</code> (<code>v{build_num}</code>)\n"
+        f"• <b>Файл:</b> <code>{apk_filename}</code>\n"
         f"• <b>Ветка:</b> <code>{meta['branch']}</code>\n"
         f"• <b>Автор:</b> {meta['author']}\n"
-        f"• <b>Коммит:</b> <code>{meta['commit_sha'][:7]}</code> — {meta['commit_msg']}"
+        f"• <b>Коммит:</b> <code>{short_sha}</code> — {meta['commit_msg']}"
     )
 
     for chat_id in AUTHORIZED_CHAT_IDS:
