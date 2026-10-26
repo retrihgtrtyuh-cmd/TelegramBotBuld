@@ -479,24 +479,31 @@ async def enable_github_pages_for_repo(owner: str, repo: str) -> tuple[bool, str
 async def trigger_github_workflow(
     branch: str = None,
     notes: str = "Запуск сборки из Telegram",
-    initiated_by: str = "Telegram"
+    initiated_by: str = "Telegram",
+    repo_override: str = None
 ) -> tuple[bool, str]:
     """
-    Запускает сборку APK в целевом репозитории (по умолчанию retrihgtrtyuh-cmd/xianxia-sect-maneger)
-    через вызов workflow_dispatch.
+    Запускает сборку APK в выбранном или основном репозитории через workflow_dispatch
+    (пробует основной воркфлоу, затем build-and-deploy.yml / build-apk.yml, затем repository_dispatch).
     """
     cfg = load_bot_config()
     token = cfg.get("github_pat", "")
     owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
-    repo = cfg.get("github_repo", "xianxia-sect-maneger")
-    workflow = cfg.get("github_workflow", "build-apk.yml")
+    repo = repo_override or cfg.get("github_repo", "xianxia-sect-maneger")
+    configured_wf = cfg.get("github_workflow", "build-apk.yml")
     target_branch = branch or cfg.get("github_branch", "main")
 
     if not token:
         return False, "Токен GitHub (GITHUB_PAT) еще не задан. Отправьте /token или нажмите кнопку настройки токена."
 
     headers = get_github_headers(token)
-    workflow_url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow}/dispatches"
+
+    # Список возможных файлов воркфлоу (чтобы работало и со старым build-apk.yml, и с новым build-and-deploy.yml)
+    workflows_to_try = []
+    for wf in [configured_wf, "build-and-deploy.yml", "build-apk.yml"]:
+        if wf and wf not in workflows_to_try:
+            workflows_to_try.append(wf)
+
     payload = {
         "ref": target_branch,
         "inputs": {
@@ -504,14 +511,24 @@ async def trigger_github_workflow(
         }
     }
 
+    last_err = ""
     async with aiohttp.ClientSession() as session:
-        async with session.post(workflow_url, json=payload, headers=headers) as resp:
-            if resp.status == 204:
-                return True, f"Workflow {workflow} успешно запущен в {owner}/{repo} (HTTP 204)."
+        for wf_name in workflows_to_try:
+            workflow_url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{wf_name}/dispatches"
+            async with session.post(workflow_url, json=payload, headers=headers) as resp:
+                if resp.status == 204:
+                    return True, f"Workflow {wf_name} успешно запущен в {owner}/{repo} (HTTP 204)."
+                last_err = await resp.text()
+                logger.warning(f"workflow_dispatch ({wf_name}) для {owner}/{repo} вернул HTTP {resp.status}: {last_err}")
 
-            err_text = await resp.text()
-            logger.warning(f"workflow_dispatch вернул HTTP {resp.status}: {err_text}. Пробуем repository_dispatch...")
+        # Fallback: пробуем без inputs на случай, если в YAML не описаны inputs
+        for wf_name in workflows_to_try:
+            workflow_url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{wf_name}/dispatches"
+            async with session.post(workflow_url, json={"ref": target_branch}, headers=headers) as resp:
+                if resp.status == 204:
+                    return True, f"Workflow {wf_name} успешно запущен в {owner}/{repo} (HTTP 204)."
 
+        # Fallback 2: repository_dispatch
         dispatch_url = f"https://api.github.com/repos/{owner}/{repo}/dispatches"
         dispatch_payload = {
             "event_type": "build_apk",
@@ -526,51 +543,104 @@ async def trigger_github_workflow(
             if resp.status == 204:
                 return True, f"Repository dispatch успешно отправлен в {owner}/{repo} (HTTP 204)."
             second_err = await resp.text()
-            return False, f"Ошибка запуска на GitHub (HTTP {resp.status}): {second_err}"
+            return False, (
+                f"Не удалось запустить воркфлоу в {owner}/{repo} (HTTP {resp.status}). "
+                f"Если в этом репозитории еще не настроена автосборка, нажмите «📱 Подключить автосборку APK» в карточке репозитория. "
+                f"Детали GitHub: {last_err or second_err}"
+            )
 
 
 # =====================================================================
-# 4. ФОНОВАЯ ЗАДАЧА: АВТООТСЛЕЖИВАНИЕ НОВЫХ РЕПОЗИТОРИЕВ (КАЖДЫЕ 3 МИНУТЫ)
+# 4. УПРАВЛЕНИЕ ВСЕМИ РЕПОЗИТОРИЯМИ И ФОНОВОЕ ОТСЛЕЖИВАНИЕ (КАЖДЫЕ 3 МИНУТЫ)
 # =====================================================================
 
-def get_new_repo_card_keyboard(repo_name: str) -> InlineKeyboardMarkup:
-    """Кнопки карточки нового репозитория + возврат в главное меню."""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📱 Подключить автосборку APK",
-                    callback_data=f"repo_apk:{repo_name}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🌐 Включить GitHub Pages",
-                    callback_data=f"repo_pages:{repo_name}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="❌ Пропустить",
-                    callback_data=f"repo_skip:{repo_name}"
-                ),
-                InlineKeyboardButton(
-                    text="⬅️ Назад в меню",
-                    callback_data="cb_back_main"
-                )
-            ]
-        ]
-    )
+def get_new_repo_card_keyboard(repo_name: str, is_new_notification: bool = False) -> InlineKeyboardMarkup:
+    """
+    Клавиатура управления конкретным репозиторием:
+    позволяет подключить автосборку APK, запустить билд прямо сейчас, проверить статус,
+    включить GitHub Pages или сделать этот репозиторий основным.
+    """
+    cfg = load_bot_config()
+    active_repo = cfg.get("github_repo", "xianxia-sect-maneger")
+    is_active = (repo_name == active_repo)
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="📱 Подключить автосборку APK (CI/CD)",
+                callback_data=f"repo_apk:{repo_name}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🚀 Собрать APK сейчас",
+                callback_data=f"repo_build_now:{repo_name}"
+            ),
+            InlineKeyboardButton(
+                text="📊 Статус сборок",
+                callback_data=f"repo_status:{repo_name}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🌐 Включить GitHub Pages",
+                callback_data=f"repo_pages:{repo_name}"
+            )
+        ],
+    ]
+
+    if not is_active:
+        rows.append([
+            InlineKeyboardButton(
+                text="⭐ Сделать основным проектом бота",
+                callback_data=f"repo_set_active:{repo_name}"
+            )
+        ])
+
+    if is_new_notification:
+        rows.append([
+            InlineKeyboardButton(
+                text="❌ Пропустить",
+                callback_data=f"repo_skip:{repo_name}"
+            ),
+            InlineKeyboardButton(
+                text="📂 Все репозитории",
+                callback_data="cb_repos_list"
+            )
+        ])
+    else:
+        rows.append([
+            InlineKeyboardButton(
+                text="⬅️ К списку репозиториев",
+                callback_data="cb_repos_list"
+            ),
+            InlineKeyboardButton(
+                text="🏠 В меню",
+                callback_data="cb_back_main"
+            )
+        ])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def get_repo_action_result_keyboard(repo_name: str) -> InlineKeyboardMarkup:
-    """Кнопки возврата к карточке репозитория или в главное меню после выполнения действия."""
+    """Кнопки возврата к карточке репозитория, списку всех репозиториев или в главное меню."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="⬅️ Назад к карточке репозитория",
+                    text="🚀 Запустить сборку APK сейчас",
+                    callback_data=f"repo_build_now:{repo_name}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"⬅️ Назад к {repo_name}",
                     callback_data=f"repo_card:{repo_name}"
+                ),
+                InlineKeyboardButton(
+                    text="📂 Все репо",
+                    callback_data="cb_repos_list"
                 )
             ],
             [
@@ -581,6 +651,34 @@ def get_repo_action_result_keyboard(repo_name: str) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def get_repos_list_keyboard(repo_names: list[str]) -> InlineKeyboardMarkup:
+    """
+    Строит список кнопок со ВСЕМИ репозиториями пользователя,
+    чтобы можно было открыть любой из них и настроить автосборку APK или Pages.
+    """
+    cfg = load_bot_config()
+    active_repo = cfg.get("github_repo", "xianxia-sect-maneger")
+    rows = []
+
+    for r_name in repo_names:
+        prefix = "⭐ " if r_name == active_repo else "📦 "
+        suffix = " (основной)" if r_name == active_repo else ""
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{prefix}{r_name}{suffix}",
+                callback_data=f"repo_card:{r_name}"
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(text="🔄 Обновить список с GitHub", callback_data="cb_check_repos")
+    ])
+    rows.append([
+        InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="cb_back_main")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def get_back_to_main_keyboard() -> InlineKeyboardMarkup:
@@ -603,7 +701,7 @@ def get_back_to_setup_keyboard(repo_name: str = None) -> InlineKeyboardMarkup:
     if repo_name:
         rows.append([
             InlineKeyboardButton(
-                text="⬅️ Назад к карточке репозитория",
+                text=f"⬅️ Назад к {repo_name}",
                 callback_data=f"repo_card:{repo_name}"
             )
         ])
@@ -621,8 +719,8 @@ def get_back_to_setup_keyboard(repo_name: str = None) -> InlineKeyboardMarkup:
 
 
 async def fetch_public_repos(owner: str, token: str = "") -> list[dict]:
-    """Получает список публичных репозиториев профиля GitHub."""
-    url = f"https://api.github.com/users/{owner}/repos?type=public&sort=created&direction=desc&per_page=50"
+    """Получает список репозиториев профиля GitHub."""
+    url = f"https://api.github.com/users/{owner}/repos?type=public&sort=updated&direction=desc&per_page=50"
     headers = get_github_headers(token)
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers) as resp:
@@ -633,38 +731,66 @@ async def fetch_public_repos(owner: str, token: str = "") -> list[dict]:
             return data if isinstance(data, list) else []
 
 
+async def get_all_tracked_repos_view() -> tuple[str, InlineKeyboardMarkup]:
+    """
+    Синхронизирует список репозиториев с GitHub и возвращает текст + кнопки
+    для выбора ЛЮБОГО из существующих репозиториев пользователя.
+    """
+    cfg = load_bot_config()
+    owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
+    active_repo = cfg.get("github_repo", "xianxia-sect-maneger")
+    token = cfg.get("github_pat", "")
+
+    repos_data = await fetch_public_repos(owner, token)
+    known_names, _ = load_known_repos()
+
+    if repos_data:
+        fetched_names = [r["name"] for r in repos_data if r.get("name")]
+        merged_set = set(fetched_names) | known_names
+        save_known_repos(merged_set)
+        # Сохраняем порядок с GitHub (сначала самые свежие), плюс остальные из known_repos
+        ordered_repos = fetched_names + [n for n in sorted(known_names) if n not in fetched_names]
+    else:
+        ordered_repos = sorted(list(known_names)) if known_names else [active_repo]
+
+    text = (
+        f"📂 <b>Ваши репозитории в профиле <code>{owner}</code> ({len(ordered_repos)} шт.):</b>\n\n"
+        f"• <b>Основной проект по умолчанию:</b> <code>{active_repo}</code> (отмечен ⭐)\n\n"
+        f"👇 <b>Нажмите на любой репозиторий ниже</b>, чтобы:\n"
+        f"— 📱 В 1 клик подключить ему автосборку APK (создать workflow + секреты)\n"
+        f"— 🚀 Запустить сборку APK для него прямо сейчас\n"
+        f"— 🌐 Включить ему GitHub Pages\n"
+        f"— ⭐ Сделать его основным репозиторием бота"
+    )
+    return text, get_repos_list_keyboard(ordered_repos)
+
+
 async def check_for_new_repositories(manual_trigger_chat_id: int = None) -> None:
     """
     Проверяет появление новых публичных репозиториев.
-    При первом запуске сохраняет текущие в known_repos.json без спама.
+    При ручном вызове из чата всегда показывает список ВСЕХ доступных репозиториев кнопками!
     """
     cfg = load_bot_config()
     owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
     token = cfg.get("github_pat", "")
 
-    repos_kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🔄 Проверить снова", callback_data="cb_check_repos"),
-                InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="cb_back_main")
-            ]
-        ]
-    )
-
     repos_data = await fetch_public_repos(owner, token)
     if not repos_data:
         if manual_trigger_chat_id:
+            known_names, _ = load_known_repos()
+            fallback_list = sorted(list(known_names)) if known_names else [cfg.get("github_repo", "xianxia-sect-maneger")]
             await bot.send_message(
                 manual_trigger_chat_id,
-                f"⚠️ Не удалось получить список репозиториев профиля <code>{owner}</code>.",
-                reply_markup=repos_kb
+                f"⚠️ Не удалось обновить список с GitHub для <code>{owner}</code>. Показаны сохраненные репозитории:",
+                reply_markup=get_repos_list_keyboard(fallback_list)
             )
         return
 
-    current_names = {r["name"] for r in repos_data if r.get("name")}
+    fetched_names = [r["name"] for r in repos_data if r.get("name")]
+    current_names = set(fetched_names)
     known_names, initialized = load_known_repos()
 
-    # Первый старт: просто запоминаем текущие репозитории, не спамим в чат
+    # Первый старт: запоминаем текущие репозитории
     if not initialized:
         save_known_repos(current_names)
         logger.info(f"Инициализирован known_repos.json: запомнено {len(current_names)} существующих репозиториев.")
@@ -672,9 +798,9 @@ async def check_for_new_repositories(manual_trigger_chat_id: int = None) -> None
             await bot.send_message(
                 manual_trigger_chat_id,
                 f"✅ База репозиториев инициализирована (<code>known_repos.json</code>).\n"
-                f"Запомнено текущих проектов: <b>{len(current_names)}</b>.\n"
-                f"Теперь бот каждые 3 минуты отслеживает появление новых репозиториев в профиле <code>{owner}</code>.",
-                reply_markup=repos_kb
+                f"Найдено ваших репозиториев: <b>{len(fetched_names)}</b>.\n\n"
+                f"👇 <b>Выберите любой репозиторий ниже</b> для настройки автосборки APK или запуска билда:",
+                reply_markup=get_repos_list_keyboard(fetched_names)
             )
         return
 
@@ -683,8 +809,9 @@ async def check_for_new_repositories(manual_trigger_chat_id: int = None) -> None
         if manual_trigger_chat_id:
             await bot.send_message(
                 manual_trigger_chat_id,
-                f"🔍 Проверка завершена: новых репозиториев в профиле <code>{owner}</code> пока нет (отслеживается: {len(known_names)}).",
-                reply_markup=repos_kb
+                f"🔍 <b>Новых репозиториев пока не появилось</b> (отслеживается: <b>{len(current_names)}</b>).\n\n"
+                f"👇 Вы можете выбрать <b>любой из ваших репозиториев</b> ниже, чтобы подключить ему автосборку APK, включить GitHub Pages или запустить билд:",
+                reply_markup=get_repos_list_keyboard(fetched_names)
             )
         return
 
@@ -710,7 +837,7 @@ async def check_for_new_repositories(manual_trigger_chat_id: int = None) -> None
             f"• <b>Ветка по умолчанию:</b> <code>{r.get('default_branch', 'main')}</code>\n\n"
             f"Выберите действие для настройки в 1 клик:"
         )
-        kb = get_new_repo_card_keyboard(r_name)
+        kb = get_new_repo_card_keyboard(r_name, is_new_notification=True)
 
         for chat_id in AUTHORIZED_CHAT_IDS:
             try:
@@ -737,7 +864,7 @@ async def background_repo_watcher():
 
 
 # =====================================================================
-# 5. КЛАВИАТУРЫ И ИНТЕРАКТИВНАЯ НАСТРОЙКА (/setup, /token)
+# 5. КЛАВИАТУРЫ И ИНТЕРАКТИВНАЯ НАСТРОЙКА (/setup, /token, /repos)
 # =====================================================================
 
 def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
@@ -746,10 +873,10 @@ def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [
                 KeyboardButton(text="🚀 Собрать APK (main)"),
-                KeyboardButton(text="📊 Статус CI/CD"),
+                KeyboardButton(text="📂 Мои репозитории"),
             ],
             [
-                KeyboardButton(text="🔍 Проверить репозитории"),
+                KeyboardButton(text="📊 Статус CI/CD"),
                 KeyboardButton(text="⚙️ Настройки / Токен"),
             ],
             [
@@ -770,10 +897,10 @@ def get_main_menu_text(chat_id: int) -> str:
     return (
         f"<b>CI/CD Панель управления сборкой APK и репозиториями</b>\n\n"
         f"• <b>Профиль GitHub:</b> <code>{cfg.get('github_owner')}</code>\n"
-        f"• <b>Текущий проект:</b> <code>{cfg.get('github_repo')}</code>\n"
-        f"• <b>Отслеживаемых репо:</b> <code>{len(known_repos)}</code> (проверка каждые 3 мин)\n"
+        f"• <b>Активный проект:</b> <code>{cfg.get('github_repo')}</code>\n"
+        f"• <b>Всего репозиториев в базе:</b> <code>{len(known_repos)}</code> (автопроверка каждые 3 мин)\n"
         f"• <b>Текущий Chat ID:</b> <code>{chat_id}</code> ({auth_status})\n\n"
-        f"Используйте кнопки ниже для быстрого управления:"
+        f"Нажмите <b>«📂 Все мои репозитории»</b>, чтобы настроить автосборку APK или запустить билд для любого из ваших проектов:"
     )
 
 
@@ -782,10 +909,18 @@ def get_start_inline_keyboard() -> InlineKeyboardMarkup:
     cfg = load_bot_config()
     owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
     repo = cfg.get("github_repo", "xianxia-sect-maneger")
+    known_repos, _ = load_known_repos()
+    count_label = f" ({len(known_repos)})" if known_repos else ""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🚀 Запустить сборку APK", callback_data="cb_build"),
+                InlineKeyboardButton(
+                    text=f"📂 Все мои репозитории{count_label} — выбор и автосборка",
+                    callback_data="cb_repos_list"
+                )
+            ],
+            [
+                InlineKeyboardButton(text=f"🚀 Собрать {repo}", callback_data="cb_build"),
                 InlineKeyboardButton(text="📊 Статус Actions", callback_data="cb_status"),
             ],
             [
@@ -832,8 +967,8 @@ def get_setup_inline_keyboard() -> InlineKeyboardMarkup:
                     callback_data="setup_field:github_owner"
                 ),
                 InlineKeyboardButton(
-                    text="🧪 Тест карточки нового репо",
-                    callback_data="cb_simulate_new_repo"
+                    text="📂 Выбрать репозиторий",
+                    callback_data="cb_repos_list"
                 )
             ],
             [
@@ -866,8 +1001,15 @@ async def prompt_for_missing_token(chat_id: int, pending_action: str = None, rep
     )
 
 
-async def perform_build(chat_id: int, sender_label: str, branch: str, notes: str, reply_to_message: Message = None):
-    """Выполняет запуск сборки APK и отправляет статус с кнопкой перехода на GitHub и кнопкой Назад."""
+async def perform_build(
+    chat_id: int,
+    sender_label: str,
+    branch: str,
+    notes: str,
+    reply_to_message: Message = None,
+    repo_override: str = None
+):
+    """Выполняет запуск сборки APK для выбранного (или активного) репозитория."""
     if not is_authorized(chat_id):
         text = f"⛔ Chat ID <code>{chat_id}</code> не авторизован для запуска сборки."
         if reply_to_message:
@@ -878,11 +1020,10 @@ async def perform_build(chat_id: int, sender_label: str, branch: str, notes: str
 
     cfg = load_bot_config()
     owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
-    repo = cfg.get("github_repo", "xianxia-sect-maneger")
-    workflow = cfg.get("github_workflow", "build-apk.yml")
+    repo = repo_override or cfg.get("github_repo", "xianxia-sect-maneger")
 
     init_text = (
-        f"⏳ Запускаю воркфлоу <code>{workflow}</code> в репозитории "
+        f"⏳ Запускаю сборку APK в репозитории "
         f"<code>{owner}/{repo}</code> (ветка: <code>{branch}</code>)..."
     )
     if reply_to_message:
@@ -893,21 +1034,30 @@ async def perform_build(chat_id: int, sender_label: str, branch: str, notes: str
     success, details = await trigger_github_workflow(
         branch=branch,
         notes=notes,
-        initiated_by=sender_label
+        initiated_by=sender_label,
+        repo_override=repo
     )
 
     if success:
-        append_to_dev_log(f"Сборка APK запущена из {sender_label}, ветка `{branch}`: {notes}")
+        append_to_dev_log(f"Сборка APK ({owner}/{repo}) запущена из {sender_label}, ветка `{branch}`: {notes}")
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text="🌐 Открыть GitHub Actions",
                     url=f"https://github.com/{owner}/{repo}/actions"
+                ),
+                InlineKeyboardButton(
+                    text="📊 Статус сборки",
+                    callback_data=f"repo_status:{repo}"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ Назад в главное меню",
+                    text=f"⬅️ К репозиторию {repo}",
+                    callback_data=f"repo_card:{repo}"
+                ),
+                InlineKeyboardButton(
+                    text="🏠 В меню",
                     callback_data="cb_back_main"
                 )
             ]
@@ -915,7 +1065,6 @@ async def perform_build(chat_id: int, sender_label: str, branch: str, notes: str
         await status_msg.edit_text(
             f"✅ <b>Сборка успешно инициирована в GitHub Actions!</b>\n\n"
             f"• <b>Репозиторий:</b> <code>{owner}/{repo}</code>\n"
-            f"• <b>Файл сборки:</b> <code>{workflow}</code>\n"
             f"• <b>Ветка:</b> <code>{branch}</code>\n"
             f"• <b>Инициатор:</b> {sender_label}\n"
             f"• <b>Примечание:</b> {notes}\n\n"
@@ -925,31 +1074,45 @@ async def perform_build(chat_id: int, sender_label: str, branch: str, notes: str
     else:
         err_kb = InlineKeyboardMarkup(inline_keyboard=[
             [
+                InlineKeyboardButton(
+                    text="📱 Подключить автосборку APK в 1 клик",
+                    callback_data=f"repo_apk:{repo}"
+                )
+            ],
+            [
                 InlineKeyboardButton(text="⚙️ Настроить токен", callback_data="cb_setup_menu"),
-                InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="cb_back_main")
+                InlineKeyboardButton(text=f"⬅️ К {repo}", callback_data=f"repo_card:{repo}")
+            ],
+            [
+                InlineKeyboardButton(text="🏠 В главное меню", callback_data="cb_back_main")
             ]
         ])
         await status_msg.edit_text(
-            f"❌ <b>Ошибка запуска сборки:</b>\n<code>{details}</code>",
+            f"❌ <b>Ошибка запуска сборки в <code>{owner}/{repo}</code>:</b>\n<code>{details}</code>",
             reply_markup=err_kb
         )
 
 
-async def get_status_text() -> tuple[str, InlineKeyboardMarkup]:
-    """Запрашивает статус последнего запуска на GitHub Actions и возвращает клавиатуру с кнопкой Назад."""
+async def get_status_text(repo_override: str = None) -> tuple[str, InlineKeyboardMarkup]:
+    """Запрашивает статус последнего запуска на GitHub Actions для выбранного или активного репозитория."""
     cfg = load_bot_config()
     token = cfg.get("github_pat", "")
     owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
-    repo = cfg.get("github_repo", "xianxia-sect-maneger")
+    repo = repo_override or cfg.get("github_repo", "xianxia-sect-maneger")
+
+    refresh_cb = f"repo_status:{repo}" if repo_override else "cb_status"
+    back_row = [
+        InlineKeyboardButton(text=f"⬅️ К {repo}", callback_data=f"repo_card:{repo}"),
+        InlineKeyboardButton(text="📂 Все репо", callback_data="cb_repos_list"),
+        InlineKeyboardButton(text="🏠 Меню", callback_data="cb_back_main")
+    ]
 
     fallback_kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="⚙️ Настроить токен", callback_data="cb_setup_menu"),
-            InlineKeyboardButton(text="🔄 Обновить", callback_data="cb_status")
+            InlineKeyboardButton(text="🔄 Обновить", callback_data=refresh_cb)
         ],
-        [
-            InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="cb_back_main")
-        ]
+        back_row
     ])
 
     if not token:
@@ -964,12 +1127,21 @@ async def get_status_text() -> tuple[str, InlineKeyboardMarkup]:
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers) as resp:
             if resp.status != 200:
-                return f"⚠️ Не удалось получить статус (HTTP {resp.status}).", fallback_kb
+                return f"⚠️ Не удалось получить статус для <code>{owner}/{repo}</code> (HTTP {resp.status}).", fallback_kb
             data = await resp.json()
 
     runs = data.get("workflow_runs", [])
     if not runs:
-        return f"Сборок в репозитории <code>{owner}/{repo}</code> пока не найдено.", get_back_to_main_keyboard()
+        empty_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📱 Подключить автосборку APK",
+                    callback_data=f"repo_apk:{repo}"
+                )
+            ],
+            back_row
+        ])
+        return f"Сборок в репозитории <code>{owner}/{repo}</code> пока не найдено.", empty_kb
 
     latest = runs[0]
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -978,11 +1150,9 @@ async def get_status_text() -> tuple[str, InlineKeyboardMarkup]:
                 text="🌐 Открыть на GitHub",
                 url=latest.get("html_url", f"https://github.com/{owner}/{repo}/actions")
             ),
-            InlineKeyboardButton(text="🔄 Обновить", callback_data="cb_status")
+            InlineKeyboardButton(text="🔄 Обновить", callback_data=refresh_cb)
         ],
-        [
-            InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="cb_back_main")
-        ]
+        back_row
     ])
     text = (
         f"📊 <b>Статус последнего запуска CI/CD:</b>\n\n"
@@ -1026,7 +1196,7 @@ def get_setup_summary_text() -> str:
     return (
         f"⚙️ <b>Настройки бота и автосборки (bot_config.json)</b>\n\n"
         f"• <b>GitHub профиль:</b> <code>{cfg.get('github_owner')}</code>\n"
-        f"• <b>Основной проект:</b> <code>{cfg.get('github_repo')}</code>\n"
+        f"• <b>Активный проект:</b> <code>{cfg.get('github_repo')}</code>\n"
         f"• <b>GitHub Token (PAT):</b> <code>{masked_pat}</code>\n"
         f"• <b>Keystore (.jks Base64):</b> {ks}\n"
         f"• <b>Key Alias:</b> <code>{cfg.get('key_alias') or 'не задан'}</code>\n"
@@ -1053,6 +1223,18 @@ async def cmd_start(message: Message):
             "Меню быстрых команд активировано 👇",
             reply_markup=get_main_reply_keyboard()
         )
+
+
+@router.message(Command("repos"))
+@router.channel_post(Command("repos"))
+@router.message(F.text == "📂 Мои репозитории")
+async def cmd_repos_list(message: Message):
+    """Открывает интерактивный список ВСЕХ репозиториев пользователя."""
+    if not is_authorized(message.chat.id):
+        return
+    PENDING_INPUT_STATE.pop(message.chat.id, None)
+    text, kb = await get_all_tracked_repos_view()
+    await message.answer(text, reply_markup=kb)
 
 
 @router.message(Command("setup"))
@@ -1162,7 +1344,7 @@ async def reply_btn_info(message: Message):
     await message.answer(
         f"ℹ️ <b>Информация о сборке и мониторинге:</b>\n\n"
         f"• <b>Профиль:</b> <code>{cfg.get('github_owner')}</code>\n"
-        f"• <b>Основной репозиторий:</b> <code>{cfg.get('github_repo')}</code>\n"
+        f"• <b>Активный репозиторий:</b> <code>{cfg.get('github_repo')}</code>\n"
         f"• <b>Файл воркфлоу:</b> <code>{cfg.get('github_workflow')}</code>\n"
         f"• <b>Ветка:</b> <code>{cfg.get('github_branch')}</code>\n"
         f"• <b>Известных репозиториев в базе:</b> <code>{len(known_repos)}</code>\n"
@@ -1189,6 +1371,19 @@ async def callback_back_main(call: CallbackQuery):
         await call.message.answer(text, reply_markup=kb)
 
 
+@router.callback_query(F.data == "cb_repos_list")
+async def callback_repos_list(call: CallbackQuery):
+    """Показывает интерактивный список ВСЕХ репозиториев пользователя."""
+    await call.answer("Загружаю список репозиториев...")
+    chat_id = call.message.chat.id
+    PENDING_INPUT_STATE.pop(chat_id, None)
+    text, kb = await get_all_tracked_repos_view()
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+
+
 @router.callback_query(F.data == "cb_back_setup")
 async def callback_back_setup(call: CallbackQuery):
     """Возвращает пользователя из режима ввода поля обратно в меню настроек."""
@@ -1204,25 +1399,79 @@ async def callback_back_setup(call: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("repo_card:"))
-async def callback_back_to_repo_card(call: CallbackQuery):
-    """Возвращает пользователя обратно к карточке конкретного репозитория."""
-    await call.answer("Назад к карточке репозитория")
+async def callback_open_repo_card(call: CallbackQuery):
+    """Открывает карточку управления выбранным репозиторием."""
     repo_name = call.data.split(":", 1)[1]
+    await call.answer(f"Проект: {repo_name}")
     chat_id = call.message.chat.id
     PENDING_INPUT_STATE.pop(chat_id, None)
     cfg = load_bot_config()
     owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
+    active_repo = cfg.get("github_repo", "xianxia-sect-maneger")
+    status_badge = "⭐ Основной проект бота" if repo_name == active_repo else "📦 Подключенный репозиторий"
+
     card_text = (
-        f"🆕 <b>Управление репозиторием на GitHub</b>\n\n"
-        f"• <b>Проект:</b> <a href=\"https://github.com/{owner}/{repo_name}\">{owner}/{repo_name}</a>\n"
+        f"🛠 <b>Управление репозиторием: <code>{owner}/{repo_name}</code></b>\n\n"
+        f"• <b>Статус:</b> {status_badge}\n"
+        f"• <b>Ссылка:</b> <a href=\"https://github.com/{owner}/{repo_name}\">github.com/{owner}/{repo_name}</a>\n"
         f"• <b>Ветка по умолчанию:</b> <code>main</code>\n\n"
-        f"Выберите действие для настройки в 1 клик:"
+        f"Выберите действие для этого репозитория:"
     )
     kb = get_new_repo_card_keyboard(repo_name)
     try:
         await call.message.edit_text(card_text, reply_markup=kb, disable_web_page_preview=True)
     except Exception:
         await call.message.answer(card_text, reply_markup=kb, disable_web_page_preview=True)
+
+
+@router.callback_query(F.data.startswith("repo_set_active:"))
+async def callback_repo_set_active(call: CallbackQuery):
+    """Делает выбранный репозиторий основным по умолчанию для бота."""
+    repo_name = call.data.split(":", 1)[1]
+    save_bot_config({"github_repo": repo_name})
+    await call.answer(f"Проект {repo_name} теперь основной!", show_alert=True)
+    cfg = load_bot_config()
+    owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
+    card_text = (
+        f"🛠 <b>Управление репозиторием: <code>{owner}/{repo_name}</code></b>\n\n"
+        f"• <b>Статус:</b> ⭐ Основной проект бота (сохранено в <code>bot_config.json</code>)\n"
+        f"• <b>Ссылка:</b> <a href=\"https://github.com/{owner}/{repo_name}\">github.com/{owner}/{repo_name}</a>\n\n"
+        f"Выберите действие для этого репозитория:"
+    )
+    kb = get_new_repo_card_keyboard(repo_name)
+    try:
+        await call.message.edit_text(card_text, reply_markup=kb, disable_web_page_preview=True)
+    except Exception:
+        await call.message.answer(card_text, reply_markup=kb, disable_web_page_preview=True)
+
+
+@router.callback_query(F.data.startswith("repo_build_now:"))
+async def callback_repo_build_now(call: CallbackQuery):
+    """Запускает сборку APK в конкретном выбранном репозитории."""
+    repo_name = call.data.split(":", 1)[1]
+    await call.answer(f"Запускаю сборку в {repo_name}...")
+    cfg = load_bot_config()
+    sender_label = f"@{call.from_user.username}" if call.from_user and call.from_user.username else str(call.message.chat.id)
+    await perform_build(
+        call.message.chat.id,
+        sender_label,
+        cfg.get("github_branch", "main"),
+        f"Запуск сборки для {repo_name} из карточки репозитория",
+        reply_to_message=call.message,
+        repo_override=repo_name
+    )
+
+
+@router.callback_query(F.data.startswith("repo_status:"))
+async def callback_repo_status(call: CallbackQuery):
+    """Проверяет статус сборок для конкретного выбранного репозитория."""
+    repo_name = call.data.split(":", 1)[1]
+    await call.answer(f"Статус {repo_name}...")
+    text, kb = await get_status_text(repo_override=repo_name)
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
 
 
 @router.callback_query(F.data == "cb_build")
@@ -1289,13 +1538,13 @@ async def callback_simulate_new_repo(call: CallbackQuery):
     try:
         await call.message.edit_text(
             card_text,
-            reply_markup=get_new_repo_card_keyboard(repo),
+            reply_markup=get_new_repo_card_keyboard(repo, is_new_notification=True),
             disable_web_page_preview=True
         )
     except Exception:
         await call.message.answer(
             card_text,
-            reply_markup=get_new_repo_card_keyboard(repo),
+            reply_markup=get_new_repo_card_keyboard(repo, is_new_notification=True),
             disable_web_page_preview=True
         )
 
@@ -1334,7 +1583,7 @@ async def callback_setup_field(call: CallbackQuery):
 
 
 # ---------------------------------------------------------------------
-# КНОПКИ КАРТОЧКИ НОВОГО РЕПОЗИТОРИЯ: [📱 APK] [🌐 Pages] [❌ Пропустить]
+# КНОПКИ КАРТОЧКИ РЕПОЗИТОРИЯ: [📱 APK] [🌐 Pages] [❌ Пропустить]
 # ---------------------------------------------------------------------
 
 @router.callback_query(F.data.startswith("repo_apk:"))
@@ -1363,7 +1612,8 @@ async def callback_repo_apk(call: CallbackQuery):
             f"✅ <b>Автосборка настроена! Следующий пуш соберет APK</b>\n\n"
             f"• <b>Репозиторий:</b> <code>{owner}/{repo_name}</code>\n"
             f"• <b>Воркфлоу:</b> <code>.github/workflows/build-and-deploy.yml</code>\n"
-            f"• <b>Статус секретов:</b> {details}",
+            f"• <b>Статус секретов:</b> {details}\n\n"
+            f"Вы также можете запустить сборку прямо сейчас кнопкой ниже:",
             reply_markup=res_kb
         )
     else:

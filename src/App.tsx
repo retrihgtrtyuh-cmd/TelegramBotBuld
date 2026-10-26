@@ -18,7 +18,10 @@ import {
   Eye,
   EyeOff,
   X,
-  Key
+  Key,
+  ChevronDown,
+  Globe,
+  Smartphone
 } from 'lucide-react';
 
 interface BuildRun {
@@ -50,8 +53,224 @@ interface ChatMessage {
   };
 }
 
+interface DevLogEntry {
+  date: string;
+  tag: string;
+  content: string;
+}
+
+interface RepositoryProject {
+  id: string;
+  owner: string;
+  repo: string;
+  description: string;
+  defaultBranch: string;
+  workflowFile: string;
+  dispatchEvent: string;
+  autoApkEnabled: boolean;
+  githubPagesEnabled: boolean;
+  pagesUrl: string;
+  builds: BuildRun[];
+  messages: ChatMessage[];
+  devLogEntries: DevLogEntry[];
+}
+
 export default function App() {
-  // Interactive Configuration State
+  // Multi-Repository State (all 3 tracked repositories + ability to add more)
+  const [repositories, setRepositories] = useState<RepositoryProject[]>([
+    {
+      id: 'xianxia-sect-maneger',
+      owner: 'retrihgtrtyuh-cmd',
+      repo: 'xianxia-sect-maneger',
+      description: 'Основной проект: симулятор управления сектой культиваторов (Android Gradle)',
+      defaultBranch: 'main',
+      workflowFile: 'build-apk.yml',
+      dispatchEvent: 'build_apk',
+      autoApkEnabled: true,
+      githubPagesEnabled: true,
+      pagesUrl: 'https://retrihgtrtyuh-cmd.github.io/xianxia-sect-maneger/',
+      builds: [
+        {
+          id: 42,
+          sha: '8f4d2a1',
+          branch: 'main',
+          author: 'retrihgtrtyuh-cmd',
+          message: 'feat(combat): оптимизация рендера частиц и подпись релизного APK',
+          trigger: 'workflow_dispatch',
+          status: 'completed',
+          apkName: 'xianxia-sect-v1.4.2-b42.apk',
+          apkSize: '64.8 MB',
+          backupName: 'backup_8f4d2a1_20261026_1420.tar.gz',
+          timestamp: '2026-10-26 14:20 UTC',
+        },
+        {
+          id: 41,
+          sha: '3c9e11b',
+          branch: 'main',
+          author: 'retrihgtrtyuh-cmd',
+          message: 'fix(audio): устранен краш при смене сцены в главном меню',
+          trigger: 'push',
+          status: 'completed',
+          apkName: 'xianxia-sect-v1.4.1-b41.apk',
+          apkSize: '64.5 MB',
+          backupName: 'backup_3c9e11b_20261026_1105.tar.gz',
+          timestamp: '2026-10-26 11:05 UTC',
+        },
+      ],
+      messages: [
+        {
+          id: 'm1',
+          sender: 'user',
+          text: '/start',
+          time: '14:18',
+        },
+        {
+          id: 'm2',
+          sender: 'bot',
+          text: `CI/CD Панель управления сборкой APK и репозиториями\n• Профиль GitHub: retrihgtrtyuh-cmd\n• Активный проект: xianxia-sect-maneger\n• Всего репозиториев в базе: 3 (автопроверка каждые 3 мин)\n• Текущий Chat ID: -1003962969725 (Доступ разрешен)`,
+          time: '14:18',
+        },
+        {
+          id: 'm3',
+          sender: 'user',
+          text: '/build main Релизный билд для закрытого бета-теста',
+          time: '14:19',
+        },
+        {
+          id: 'm4',
+          sender: 'bot',
+          text: `✅ Сборка успешно инициирована в GitHub Actions!\n• Репозиторий: retrihgtrtyuh-cmd/xianxia-sect-maneger\n• Воркфлоу: build-apk.yml\n• Ветка: main`,
+          time: '14:19',
+        },
+        {
+          id: 'm5',
+          sender: 'bot',
+          text: `📦 Готова новая сборка APK (#42)\nКоммит: 8f4d2a1 — feat(combat): оптимизация рендера частиц и подпись релизного APK`,
+          time: '14:20',
+          attachment: {
+            filename: 'xianxia-sect-v1.4.2-b42.apk',
+            size: '64.8 MB',
+            backupArchive: 'backup_8f4d2a1_20261026_1420.tar.gz',
+            sha: '8f4d2a1',
+            branch: 'main',
+            author: 'retrihgtrtyuh-cmd',
+          },
+        },
+      ],
+      devLogEntries: [
+        {
+          date: '2026-10-26 14:20 UTC',
+          tag: 'CI/CD Release #42',
+          content: '[xianxia-sect-maneger] Сборка #42 (8f4d2a1): xianxia-sect-v1.4.2-b42.apk и архив backup_8f4d2a1_20261026_1420.tar.gz доставлены в Telegram.',
+        },
+        {
+          date: '2026-10-26 14:19 UTC',
+          tag: 'Telegram Trigger',
+          content: '[xianxia-sect-maneger] Запущена сборка APK по команде /build из Telegram, ветка main.',
+        },
+      ],
+    },
+    {
+      id: 'cultivation-idle-rpg',
+      owner: 'retrihgtrtyuh-cmd',
+      repo: 'cultivation-idle-rpg',
+      description: 'Второй репозиторий: мобильная Idle-RPG с автосборкой через build-and-deploy.yml',
+      defaultBranch: 'main',
+      workflowFile: 'build-and-deploy.yml',
+      dispatchEvent: 'build_apk',
+      autoApkEnabled: true,
+      githubPagesEnabled: false,
+      pagesUrl: 'https://retrihgtrtyuh-cmd.github.io/cultivation-idle-rpg/',
+      builds: [
+        {
+          id: 12,
+          sha: '9a1c4f0',
+          branch: 'main',
+          author: 'retrihgtrtyuh-cmd',
+          message: 'feat(inventory): система артефактов и баланс духовных камней',
+          trigger: 'push',
+          status: 'completed',
+          apkName: 'cultivation-idle-v0.8.4-b12.apk',
+          apkSize: '48.2 MB',
+          backupName: 'backup_9a1c4f0_20261026_1210.tar.gz',
+          timestamp: '2026-10-26 12:10 UTC',
+        },
+      ],
+      messages: [
+        {
+          id: 'c1',
+          sender: 'bot',
+          text: `🛠 Управление репозиторием: retrihgtrtyuh-cmd/cultivation-idle-rpg\n• Статус: Автосборка APK подключена (.github/workflows/build-and-deploy.yml)\n• Секреты записаны: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, KEYSTORE_BASE64`,
+          time: '12:08',
+        },
+        {
+          id: 'c2',
+          sender: 'bot',
+          text: `📦 Сборка APK (#12) готова!\n• Проект: retrihgtrtyuh-cmd/cultivation-idle-rpg\n• Коммит: 9a1c4f0 — feat(inventory): система артефактов и баланс духовных камней`,
+          time: '12:10',
+          attachment: {
+            filename: 'cultivation-idle-v0.8.4-b12.apk',
+            size: '48.2 MB',
+            backupArchive: 'backup_9a1c4f0_20261026_1210.tar.gz',
+            sha: '9a1c4f0',
+            branch: 'main',
+            author: 'retrihgtrtyuh-cmd',
+          },
+        },
+      ],
+      devLogEntries: [
+        {
+          date: '2026-10-26 12:10 UTC',
+          tag: 'CI/CD Release #12',
+          content: '[cultivation-idle-rpg] Автоматическая сборка при push в main: доставлен файл cultivation-idle-v0.8.4-b12.apk.',
+        },
+        {
+          date: '2026-10-26 12:05 UTC',
+          tag: '1-Click Auto APK',
+          content: '[cultivation-idle-rpg] Через Telegram-бота автоматически создан .github/workflows/build-and-deploy.yml и прописаны Actions Secrets.',
+        },
+      ],
+    },
+    {
+      id: 'sect-alchemy-sim',
+      owner: 'retrihgtrtyuh-cmd',
+      repo: 'sect-alchemy-sim',
+      description: 'Третий отслеживаемый репозиторий: симулятор алхимии (готов к настройке CI/CD в 1 клик)',
+      defaultBranch: 'main',
+      workflowFile: 'build-and-deploy.yml',
+      dispatchEvent: 'build_apk',
+      autoApkEnabled: false,
+      githubPagesEnabled: false,
+      pagesUrl: 'https://retrihgtrtyuh-cmd.github.io/sect-alchemy-sim/',
+      builds: [],
+      messages: [
+        {
+          id: 's1',
+          sender: 'bot',
+          text: `🆕 Обнаружен репозиторий в профиле: retrihgtrtyuh-cmd/sect-alchemy-sim\n• Ветка по умолчанию: main\n• Автосборка APK: еще не подключена\n\nНажмите «📱 Подключить автосборку APK» или выберите действие в панели проекта, чтобы создать .github/workflows/build-and-deploy.yml и прописать секреты в 1 клик!`,
+          time: '14:30',
+        },
+      ],
+      devLogEntries: [
+        {
+          date: '2026-10-26 14:30 UTC',
+          tag: 'Repo Watcher',
+          content: '[sect-alchemy-sim] Репозиторий добавлен в known_repos.json. Ожидает подключения автосборки APK в 1 клик.',
+        },
+      ],
+    },
+  ]);
+
+  const [selectedRepoId, setSelectedRepoId] = useState<string>('xianxia-sect-maneger');
+  const [isRepoDropdownOpen, setIsRepoDropdownOpen] = useState(false);
+  const [newRepoNameInput, setNewRepoNameInput] = useState('');
+
+  const currentRepo = repositories.find((r) => r.id === selectedRepoId) || repositories[0];
+  const builds = currentRepo.builds;
+  const messages = currentRepo.messages;
+  const devLogEntries = currentRepo.devLogEntries;
+
+  // Interactive Configuration State synced with selected repository
   const [config, setConfig] = useState({
     githubOwner: 'retrihgtrtyuh-cmd',
     githubRepo: 'xianxia-sect-maneger',
@@ -62,6 +281,138 @@ export default function App() {
     webhookUrl: 'https://apk-bot-service.onrender.com',
     githubToken: 'github_pat_11ABCDEFG_sample_token_here',
   });
+
+  // Helper to update the active repository's state
+  const updateCurrentRepo = (updater: (repo: RepositoryProject) => RepositoryProject) => {
+    setRepositories((prev) =>
+      prev.map((r) => (r.id === currentRepo.id ? updater(r) : r))
+    );
+  };
+
+  // Switch active repository from top bar selector
+  const handleSelectRepository = (repoId: string) => {
+    const target = repositories.find((r) => r.id === repoId);
+    if (!target) return;
+    setSelectedRepoId(target.id);
+    setConfig((prev) => ({
+      ...prev,
+      githubOwner: target.owner,
+      githubRepo: target.repo,
+      defaultBranch: target.defaultBranch,
+      dispatchEvent: target.dispatchEvent,
+    }));
+    setIsRepoDropdownOpen(false);
+    setIsBuilding(false);
+    setPipelineStep(0);
+  };
+
+  // Add a new repository to the selector list
+  const handleAddRepository = (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanName = newRepoNameInput.trim().replace(/^\/+|\/+$/g, '');
+    if (!cleanName) return;
+    const existing = repositories.find((r) => r.repo.toLowerCase() === cleanName.toLowerCase());
+    if (existing) {
+      handleSelectRepository(existing.id);
+      setNewRepoNameInput('');
+      return;
+    }
+    const ts = new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+    const newProj: RepositoryProject = {
+      id: cleanName,
+      owner: config.githubOwner,
+      repo: cleanName,
+      description: 'Подключенный репозиторий профиля GitHub',
+      defaultBranch: 'main',
+      workflowFile: 'build-and-deploy.yml',
+      dispatchEvent: 'build_apk',
+      autoApkEnabled: false,
+      githubPagesEnabled: false,
+      pagesUrl: `https://${config.githubOwner}.github.io/${cleanName}/`,
+      builds: [],
+      messages: [
+        {
+          id: `init-${Date.now()}`,
+          sender: 'bot',
+          text: `🆕 Обнаружен новый репозиторий на GitHub: ${config.githubOwner}/${cleanName}\nВыберите действие для настройки в 1 клик:\n• [ 📱 Подключить автосборку APK ]\n• [ 🌐 Включить GitHub Pages ]`,
+          time: new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }),
+        },
+      ],
+      devLogEntries: [
+        {
+          date: ts,
+          tag: 'New Repo Tracked',
+          content: `[${cleanName}] Репозиторий обнаружен фоновой задачей и добавлен в known_repos.json.`,
+        },
+      ],
+    };
+    setRepositories((prev) => [...prev, newProj]);
+    setSelectedRepoId(newProj.id);
+    setConfig((prev) => ({
+      ...prev,
+      githubRepo: newProj.repo,
+      defaultBranch: newProj.defaultBranch,
+    }));
+    setNewRepoNameInput('');
+    setIsRepoDropdownOpen(false);
+  };
+
+  // 1-Click Auto APK CI/CD setup for current repository
+  const handleEnableAutoApkForCurrentRepo = () => {
+    const nowTime = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+    const ts = new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+    updateCurrentRepo((r) => ({
+      ...r,
+      autoApkEnabled: true,
+      workflowFile: r.workflowFile || 'build-and-deploy.yml',
+      messages: [
+        ...r.messages,
+        {
+          id: `apk-setup-${Date.now()}`,
+          sender: 'bot',
+          text: `✅ Автосборка настроена! Следующий пуш соберет APK\n\n• Репозиторий: ${r.owner}/${r.repo}\n• Воркфлоу: .github/workflows/${r.workflowFile}\n• Секреты записаны в Actions Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, KEYSTORE_BASE64`,
+          time: nowTime,
+        },
+      ],
+      devLogEntries: [
+        {
+          date: ts,
+          tag: '1-Click CI/CD Setup',
+          content: `[${r.repo}] Автоматически создан .github/workflows/${r.workflowFile} и зашифрованы секреты Actions Secrets через PyNaCl.`,
+        },
+        ...r.devLogEntries,
+      ],
+    }));
+  };
+
+  // 1-Click Enable GitHub Pages for current repository
+  const handleEnablePagesForCurrentRepo = () => {
+    const nowTime = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+    const ts = new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+    const siteUrl = `https://${currentRepo.owner}.github.io/${currentRepo.repo}/`;
+    updateCurrentRepo((r) => ({
+      ...r,
+      githubPagesEnabled: true,
+      pagesUrl: siteUrl,
+      messages: [
+        ...r.messages,
+        {
+          id: `pages-setup-${Date.now()}`,
+          sender: 'bot',
+          text: `🌐 GitHub Pages успешно активирован для ${r.owner}/${r.repo}!\n🔗 Готовая ссылка на сайт: ${siteUrl}`,
+          time: nowTime,
+        },
+      ],
+      devLogEntries: [
+        {
+          date: ts,
+          tag: 'GitHub Pages Active',
+          content: `[${r.repo}] Включен GitHub Pages для ветки ${r.defaultBranch}: ${siteUrl}`,
+        },
+        ...r.devLogEntries,
+      ],
+    }));
+  };
 
   // Modal State for GitHub Token Replacement
   const [isTokenModalOpen, setIsTokenModalOpen] = useState(false);
@@ -78,95 +429,6 @@ export default function App() {
   const [chatInput, setChatInput] = useState('/build main Хотфикс шейдеров и баланса');
   const [isBuilding, setIsBuilding] = useState(false);
   const [pipelineStep, setPipelineStep] = useState<number>(0);
-
-  const [builds, setBuilds] = useState<BuildRun[]>([
-    {
-      id: 42,
-      sha: '8f4d2a1',
-      branch: 'main',
-      author: 'Alexey Dev (alexey@gamedev.io)',
-      message: 'feat(combat): оптимизация рендера частиц и подпись релизного APK',
-      trigger: 'repository_dispatch',
-      status: 'completed',
-      apkName: 'app-release-v1.4.2-b42.apk',
-      apkSize: '64.8 MB',
-      backupName: 'backup_8f4d2a1_20261022_1420.tar.gz',
-      timestamp: '2026-10-22 14:20 UTC',
-    },
-    {
-      id: 41,
-      sha: '3c9e11b',
-      branch: 'main',
-      author: 'Maria Tech (maria@gamedev.io)',
-      message: 'fix(audio): устранен краш при смене сцены в главном меню',
-      trigger: 'push',
-      status: 'completed',
-      apkName: 'app-release-v1.4.1-b41.apk',
-      apkSize: '64.5 MB',
-      backupName: 'backup_3c9e11b_20261022_1105.tar.gz',
-      timestamp: '2026-10-22 11:05 UTC',
-    },
-  ]);
-
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      id: 'm1',
-      sender: 'user',
-      text: '/start',
-      time: '14:18',
-    },
-    {
-      id: 'm2',
-      sender: 'bot',
-      text: `CI/CD Бот управления сборкой мобильной игры\nВаш Chat ID: 482910492 (Доступ разрешен)\nРепозиторий: studio-games/mobile-rpg-android\n\nДоступные команды:\n• /build [ветка] [комментарий] — принудительная сборка APK\n• /status — проверить статус последнего пайплайна\n• /log [текст] — запись в корневой dev_log.md`,
-      time: '14:18',
-    },
-    {
-      id: 'm3',
-      sender: 'user',
-      text: '/build main Релизный билд для закрытого бета-теста',
-      time: '14:19',
-    },
-    {
-      id: 'm4',
-      sender: 'bot',
-      text: `Запрос на сборку принят GitHub (HTTP 204)!\nСобытие: repository_dispatch (build_apk)\nВетка: main`,
-      time: '14:19',
-    },
-    {
-      id: 'm5',
-      sender: 'bot',
-      text: `Готова новая сборка APK (#42)\nКоммит: 8f4d2a1 — feat(combat): оптимизация рендера частиц и подпись релизного APK`,
-      time: '14:20',
-      attachment: {
-        filename: 'app-release-v1.4.2-b42.apk',
-        size: '64.8 MB',
-        backupArchive: 'backup_8f4d2a1_20261022_1420.tar.gz',
-        sha: '8f4d2a1',
-        branch: 'main',
-        author: 'Alexey Dev',
-      },
-    },
-  ]);
-
-  // Dev Log State
-  const [devLogEntries, setDevLogEntries] = useState([
-    {
-      date: '2026-10-22 14:20 UTC',
-      tag: 'CI/CD Release #42',
-      content: 'Сборка #42 (8f4d2a1 от Alexey Dev): app-release-v1.4.2-b42.apk и архив backup_8f4d2a1_20261022_1420.tar.gz успешно созданы и доставлены в Telegram.',
-    },
-    {
-      date: '2026-10-22 14:19 UTC',
-      tag: 'Telegram Trigger',
-      content: 'Запущена принудительная сборка APK по команде /build из Telegram (@alexey_dev), ветка main: Релизный билд для закрытого бета-теста.',
-    },
-    {
-      date: '2026-10-22 11:05 UTC',
-      tag: 'Auto Push Backup',
-      content: 'Пайплайн GitHub Actions выполнил автоматический бэкап исходного кода в .tar.gz и подписал APK ключом из KEYSTORE_BASE64.',
-    },
-  ]);
   const [newLogText, setNewLogText] = useState('');
 
   // Keystore Base64 Helper State
@@ -658,10 +920,15 @@ CMD ["python", "bot/main.py"]`;
     URL.revokeObjectURL(url);
   };
 
-  // Interactive Simulation of Telegram Bot + GitHub Actions Pipeline
+  // Interactive Simulation of Telegram Bot + GitHub Actions Pipeline (per selected repository)
   const handleSendCommand = (cmdText?: string) => {
     const input = (cmdText ?? chatInput).trim();
     if (!input || isBuilding) return;
+
+    const activeRepoId = currentRepo.id;
+    const activeOwner = currentRepo.owner;
+    const activeRepoName = currentRepo.repo;
+    const activeWorkflow = currentRepo.workflowFile;
 
     const nowTime = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
     const userMsg: ChatMessage = {
@@ -670,21 +937,28 @@ CMD ["python", "bot/main.py"]`;
       text: input,
       time: nowTime,
     };
-    setMessages((prev) => [...prev, userMsg]);
+
+    const appendMessagesToRepo = (repoId: string, newMsgs: ChatMessage[]) => {
+      setRepositories((prev) =>
+        prev.map((r) => (r.id === repoId ? { ...r, messages: [...r.messages, ...newMsgs] } : r))
+      );
+    };
+
+    appendMessagesToRepo(activeRepoId, [userMsg]);
     if (!cmdText) setChatInput('');
 
     if (input.startsWith('/build')) {
       const parts = input.replace('/build', '').trim().split(/\s+/);
-      const branch = parts[0] || config.defaultBranch;
-      const comment = parts.slice(1).join(' ') || 'Принудительная сборка по запросу из Telegram';
+      const branch = parts[0] || currentRepo.defaultBranch;
+      const comment = parts.slice(1).join(' ') || `Сборка APK для ${activeRepoName}`;
 
       const botAck: ChatMessage = {
         id: `b-ack-${Date.now()}`,
         sender: 'bot',
-        text: `⏳ Отправляю POST https://api.github.com/repos/${config.githubOwner}/${config.githubRepo}/dispatches (event_type: "${config.dispatchEvent}", ветка: "${branch}")...\n✅ HTTP 204 No Content — пайплайн запущен!`,
+        text: `⏳ Запускаю воркфлоу ${activeWorkflow} в репозитории ${activeOwner}/${activeRepoName} (ветка: "${branch}")...\n✅ HTTP 204 No Content — пайплайн запущен!`,
         time: nowTime,
       };
-      setMessages((prev) => [...prev, botAck]);
+      appendMessagesToRepo(activeRepoId, [botAck]);
 
       // Start simulated CI/CD pipeline steps
       setIsBuilding(true);
@@ -694,63 +968,85 @@ CMD ["python", "bot/main.py"]`;
       setTimeout(() => setPipelineStep(3), 1500);
       setTimeout(() => setPipelineStep(4), 2300);
       setTimeout(() => {
-        const nextBuildNum = builds[0].id + 1;
+        const nextBuildNum = (currentRepo.builds[0]?.id || 0) + 1;
         const randomSha = Math.random().toString(16).substring(2, 9);
         const ts = new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
-        const apkFile = `app-release-v1.4.${nextBuildNum - 40}-b${nextBuildNum}.apk`;
+        const apkFile = `${activeRepoName}-v1.0.${nextBuildNum}-b${nextBuildNum}.apk`;
         const backupFile = `backup_${randomSha}_${new Date().toISOString().slice(0, 10).replace(/-/g, '')}.tar.gz`;
 
         const newBuild: BuildRun = {
           id: nextBuildNum,
           sha: randomSha,
           branch,
-          author: 'You (@telegram_admin)',
+          author: activeOwner,
           message: comment,
-          trigger: 'repository_dispatch',
+          trigger: 'workflow_dispatch',
           status: 'completed',
           apkName: apkFile,
-          apkSize: '65.1 MB',
+          apkSize: '58.4 MB',
           backupName: backupFile,
           timestamp: ts,
         };
 
-        setBuilds((prev) => [newBuild, ...prev]);
-        setDevLogEntries((prev) => [
-          {
-            date: ts,
-            tag: `CI/CD Release #${nextBuildNum}`,
-            content: `Сборка #${nextBuildNum} (${randomSha}, ветка ${branch}): ${apkFile} + бэкап ${backupFile} доставлены через бот. Комментарий: ${comment}`,
-          },
-          ...prev,
-        ]);
-
         const botApkMsg: ChatMessage = {
           id: `b-apk-${Date.now()}`,
           sender: 'bot',
-          text: `📦 Готова новая сборка APK (#${nextBuildNum})\nКоммит: ${randomSha} — ${comment}`,
+          text: `📦 Готова новая сборка APK (#${nextBuildNum}) для ${activeOwner}/${activeRepoName}\nКоммит: ${randomSha} — ${comment}`,
           time: new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }),
           attachment: {
             filename: apkFile,
-            size: '65.1 MB',
+            size: '58.4 MB',
             backupArchive: backupFile,
             sha: randomSha,
             branch,
-            author: 'You (@telegram_admin)',
+            author: activeOwner,
           },
         };
 
-        setMessages((prev) => [...prev, botApkMsg]);
+        setRepositories((prev) =>
+          prev.map((r) =>
+            r.id === activeRepoId
+              ? {
+                  ...r,
+                  autoApkEnabled: true,
+                  builds: [newBuild, ...r.builds],
+                  messages: [...r.messages, botApkMsg],
+                  devLogEntries: [
+                    {
+                      date: ts,
+                      tag: `CI/CD Release #${nextBuildNum}`,
+                      content: `[${activeRepoName}] Сборка #${nextBuildNum} (${randomSha}, ветка ${branch}): ${apkFile} + бэкап ${backupFile} доставлены через бот. Комментарий: ${comment}`,
+                    },
+                    ...r.devLogEntries,
+                  ],
+                }
+              : r
+          )
+        );
         setIsBuilding(false);
         setPipelineStep(0);
       }, 3100);
+    } else if (input.startsWith('/repos')) {
+      const repoListText = repositories
+        .map((r, i) => `${i + 1}. ${r.id === activeRepoId ? '⭐' : '📦'} ${r.owner}/${r.repo} (${r.autoApkEnabled ? 'CI/CD активен' : 'ожидает настройки'})`)
+        .join('\n');
+      appendMessagesToRepo(activeRepoId, [
+        {
+          id: `b-repos-${Date.now()}`,
+          sender: 'bot',
+          text: `📂 Ваши отслеживаемые репозитории (${repositories.length} шт.):\n${repoListText}\n\nПереключайте активный проект через селектор в верхней панели или кнопками в боте.`,
+          time: nowTime,
+        },
+      ]);
     } else if (input.startsWith('/status')) {
-      const latest = builds[0];
-      setMessages((prev) => [
-        ...prev,
+      const latest = currentRepo.builds[0];
+      appendMessagesToRepo(activeRepoId, [
         {
           id: `b-stat-${Date.now()}`,
           sender: 'bot',
-          text: `📊 Последний запуск CI/CD:\n• Сборка: #${latest.id} (completed / success)\n• Ветка: ${latest.branch}\n• Коммит: ${latest.sha} — ${latest.message}\n• Артефакт: ${latest.apkName} (${latest.apkSize})`,
+          text: latest
+            ? `📊 Статус CI/CD (${activeOwner}/${activeRepoName}):\n• Сборка: #${latest.id} (completed / success)\n• Воркфлоу: ${activeWorkflow}\n• Ветка: ${latest.branch}\n• Коммит: ${latest.sha} — ${latest.message}\n• Артефакт: ${latest.apkName} (${latest.apkSize})`
+            : `📊 Репозиторий ${activeOwner}/${activeRepoName}: сборок пока не найдено. Нажмите «Подключить автосборку APK» или вызовите /build.`,
           time: nowTime,
         },
       ]);
@@ -758,41 +1054,45 @@ CMD ["python", "bot/main.py"]`;
       const note = input.replace('/log', '').trim();
       if (note) {
         const ts = new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
-        setDevLogEntries((prev) => [
-          { date: ts, tag: 'Dev Log Запись', content: note },
-          ...prev,
-        ]);
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `b-log-${Date.now()}`,
-            sender: 'bot',
-            text: `📝 Запись добавлена в корневой dev_log.md:\n"${note}"`,
-            time: nowTime,
-          },
-        ]);
+        setRepositories((prev) =>
+          prev.map((r) =>
+            r.id === activeRepoId
+              ? {
+                  ...r,
+                  devLogEntries: [{ date: ts, tag: 'Dev Log Запись', content: `[${activeRepoName}] ${note}` }, ...r.devLogEntries],
+                  messages: [
+                    ...r.messages,
+                    {
+                      id: `b-log-${Date.now()}`,
+                      sender: 'bot',
+                      text: `📝 Запись для ${activeRepoName} добавлена в корневой dev_log.md:\n"${note}"`,
+                      time: nowTime,
+                    },
+                  ],
+                }
+              : r
+          )
+        );
       } else {
-        const topLogs = devLogEntries
-          .slice(0, 2)
+        const topLogs = currentRepo.devLogEntries
+          .slice(0, 3)
           .map((e) => `[${e.date}] ${e.content}`)
           .join('\n\n');
-        setMessages((prev) => [
-          ...prev,
+        appendMessagesToRepo(activeRepoId, [
           {
             id: `b-log-${Date.now()}`,
             sender: 'bot',
-            text: `📖 Последние записи из dev_log.md:\n\n${topLogs}`,
+            text: `📖 Последние записи dev_log.md (${activeRepoName}):\n\n${topLogs || 'Записей пока нет.'}`,
             time: nowTime,
           },
         ]);
       }
     } else {
-      setMessages((prev) => [
-        ...prev,
+      appendMessagesToRepo(activeRepoId, [
         {
           id: `b-help-${Date.now()}`,
           sender: 'bot',
-          text: `Используйте /build [ветка] [комментарий] для запуска сборки APK в GitHub Actions, /status для проверки пайплайна или /log [текст] для записи в dev_log.md.`,
+          text: `Активный проект: ${activeOwner}/${activeRepoName}.\nКоманды: /build [ветка] [комментарий], /repos (список всех проектов), /status, /log [текст].`,
           time: nowTime,
         },
       ]);
@@ -803,14 +1103,17 @@ CMD ["python", "bot/main.py"]`;
     e.preventDefault();
     if (!newLogText.trim()) return;
     const ts = new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
-    setDevLogEntries((prev) => [
-      {
-        date: ts,
-        tag: 'Ручная запись',
-        content: newLogText.trim(),
-      },
-      ...prev,
-    ]);
+    updateCurrentRepo((r) => ({
+      ...r,
+      devLogEntries: [
+        {
+          date: ts,
+          tag: 'Ручная запись',
+          content: `[${r.repo}] ${newLogText.trim()}`,
+        },
+        ...r.devLogEntries,
+      ],
+    }));
     setNewLogText('');
   };
 
@@ -931,23 +1234,111 @@ jobs:
 
   return (
     <div className="min-h-screen bg-[#0B0F17] text-slate-100 flex flex-col">
-      {/* Top Bar Contract: Zone 1 (Wordmark) — Zone 2 (4-5 Nav Links) — Zone 3 (1 Primary CTA) */}
-      <header className="flex items-center justify-between gap-8 px-6 py-4 border-b border-slate-800/80 bg-[#0B0F17]/95 sticky top-0 z-30">
-        <a
-          href="#top"
-          onClick={(e) => {
-            e.preventDefault();
-            setActiveTab('code');
-          }}
-          className="text-base font-bold tracking-tight text-white whitespace-nowrap shrink-0"
-        >
-          APK Dispatch Studio
-        </a>
+      {/* Top Bar with Multi-Repository Selector */}
+      <header className="flex items-center justify-between gap-4 px-6 py-3.5 border-b border-slate-800/80 bg-[#0B0F17]/95 sticky top-0 z-30">
+        <div className="flex items-center gap-4 min-w-0">
+          <a
+            href="#top"
+            onClick={(e) => {
+              e.preventDefault();
+              setActiveTab('code');
+            }}
+            className="text-base font-bold tracking-tight text-white whitespace-nowrap shrink-0"
+          >
+            APK Dispatch Studio
+          </a>
 
-        <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-400">
+          <span className="text-slate-700 hidden sm:inline" aria-hidden="true">/</span>
+
+          {/* Repository Switcher Dropdown in Top Header */}
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => setIsRepoDropdownOpen((prev) => !prev)}
+              className="px-3 py-1.5 text-xs font-mono font-medium text-slate-100 bg-[#131C2E] hover:bg-slate-800 border border-slate-700/80 rounded-lg transition-colors flex items-center gap-2 cursor-pointer"
+              title="Переключить активный репозиторий"
+            >
+              <FolderGit2 className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+              <span className="truncate max-w-[200px] sm:max-w-[260px]">
+                {currentRepo.owner}/{currentRepo.repo}
+              </span>
+              <span className="text-[11px] font-sans text-slate-400 hidden sm:inline">
+                ({currentRepo.autoApkEnabled ? currentRepo.workflowFile : 'не настроен'})
+              </span>
+              <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+            </button>
+
+            {isRepoDropdownOpen && (
+              <div className="absolute left-0 mt-2 w-80 sm:w-96 bg-[#111827] border border-slate-700 rounded-xl shadow-2xl z-50 overflow-hidden">
+                <div className="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+                  <span className="text-xs font-semibold text-white">
+                    Отслеживаемые репозитории ({repositories.length})
+                  </span>
+                  <span className="text-[11px] font-mono text-slate-400">known_repos.json</span>
+                </div>
+
+                <div className="divide-y divide-slate-800/80 max-h-72 overflow-y-auto">
+                  {repositories.map((repoItem) => {
+                    const isSelected = repoItem.id === currentRepo.id;
+                    return (
+                      <button
+                        key={repoItem.id}
+                        type="button"
+                        onClick={() => handleSelectRepository(repoItem.id)}
+                        className={`w-full text-left px-4 py-3 transition-colors flex items-start justify-between gap-3 cursor-pointer ${
+                          isSelected ? 'bg-sky-500/15' : 'hover:bg-slate-800/60'
+                        }`}
+                      >
+                        <div className="min-w-0 space-y-1">
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs font-mono font-semibold text-white truncate">
+                              {repoItem.owner}/{repoItem.repo}
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-slate-400 line-clamp-1">{repoItem.description}</p>
+                          <div className="flex items-center gap-2 text-[11px] text-slate-400 font-mono">
+                            <span>{repoItem.workflowFile}</span>
+                            <span aria-hidden="true">·</span>
+                            <span>Сборок: {repoItem.builds.length}</span>
+                            <span aria-hidden="true">·</span>
+                            <span className={repoItem.autoApkEnabled ? 'text-emerald-400' : 'text-amber-400'}>
+                              {repoItem.autoApkEnabled ? 'CI/CD активен' : 'Ожидает настройки'}
+                            </span>
+                          </div>
+                        </div>
+                        {isSelected && <Check className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" />}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <form
+                  onSubmit={handleAddRepository}
+                  className="p-3 bg-[#0B0F17] border-t border-slate-800 flex items-center gap-2"
+                >
+                  <input
+                    type="text"
+                    value={newRepoNameInput}
+                    onChange={(e) => setNewRepoNameInput(e.target.value)}
+                    placeholder="Имя нового репозитория..."
+                    className="flex-1 px-2.5 py-1.5 text-xs font-mono bg-[#111827] border border-slate-700 rounded-md text-white focus:outline-none focus:border-sky-500"
+                  />
+                  <button
+                    type="submit"
+                    className="px-3 py-1.5 text-xs font-semibold bg-sky-400 text-slate-950 hover:bg-sky-300 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    + Добавить
+                  </button>
+                </form>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <nav className="hidden xl:flex items-center gap-5 text-sm font-medium text-slate-400">
           <button
             onClick={() => setActiveTab('code')}
-            className={`hover:text-white transition-colors whitespace-nowrap shrink-0 py-1 border-b-2 ${
+            className={`hover:text-white transition-colors whitespace-nowrap shrink-0 py-1 border-b-2 cursor-pointer ${
               activeTab === 'code' ? 'text-white border-sky-500' : 'border-transparent'
             }`}
           >
@@ -955,15 +1346,15 @@ jobs:
           </button>
           <button
             onClick={() => setActiveTab('simulator')}
-            className={`hover:text-white transition-colors whitespace-nowrap shrink-0 py-1 border-b-2 ${
+            className={`hover:text-white transition-colors whitespace-nowrap shrink-0 py-1 border-b-2 cursor-pointer ${
               activeTab === 'simulator' ? 'text-white border-sky-500' : 'border-transparent'
             }`}
           >
-            Симулятор /build
+            Симулятор ({currentRepo.repo})
           </button>
           <button
             onClick={() => setActiveTab('secrets')}
-            className={`hover:text-white transition-colors whitespace-nowrap shrink-0 py-1 border-b-2 ${
+            className={`hover:text-white transition-colors whitespace-nowrap shrink-0 py-1 border-b-2 cursor-pointer ${
               activeTab === 'secrets' ? 'text-white border-sky-500' : 'border-transparent'
             }`}
           >
@@ -971,15 +1362,15 @@ jobs:
           </button>
           <button
             onClick={() => setActiveTab('devlog')}
-            className={`hover:text-white transition-colors whitespace-nowrap shrink-0 py-1 border-b-2 ${
+            className={`hover:text-white transition-colors whitespace-nowrap shrink-0 py-1 border-b-2 cursor-pointer ${
               activeTab === 'devlog' ? 'text-white border-sky-500' : 'border-transparent'
             }`}
           >
-            Журнал dev_log.md
+            Журнал dev_log.md ({devLogEntries.length})
           </button>
           <button
             onClick={() => setActiveTab('concept')}
-            className={`hover:text-white transition-colors whitespace-nowrap shrink-0 py-1 border-b-2 ${
+            className={`hover:text-white transition-colors whitespace-nowrap shrink-0 py-1 border-b-2 cursor-pointer ${
               activeTab === 'concept' ? 'text-white border-sky-500' : 'border-transparent'
             }`}
           >
@@ -987,7 +1378,7 @@ jobs:
           </button>
         </nav>
 
-        <div className="flex items-center gap-3 shrink-0">
+        <div className="flex items-center gap-2.5 shrink-0">
           <button
             onClick={() => {
               setTempTokenInput(config.githubToken);
@@ -997,17 +1388,17 @@ jobs:
             className="px-3 py-2 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
           >
             <KeyRound className="w-3.5 h-3.5 text-sky-400" />
-            Заменить токен GitHub
+            <span className="hidden sm:inline">Токен GitHub</span>
           </button>
           <button
             onClick={() => {
               setActiveTab('simulator');
-              handleSendCommand(`/build ${config.defaultBranch} Принудительная сборка релизного APK`);
+              handleSendCommand(`/build ${currentRepo.defaultBranch} Сборка APK для ${currentRepo.repo}`);
             }}
             className="px-4 py-2 text-xs font-semibold text-slate-950 bg-sky-400 rounded-lg hover:bg-sky-300 transition-colors whitespace-nowrap shrink-0 flex items-center gap-2 cursor-pointer"
           >
             <Play className="w-3.5 h-3.5 fill-current" />
-            Тест сборки APK
+            Собрать {currentRepo.repo}
           </button>
         </div>
       </header>
@@ -1075,6 +1466,47 @@ jobs:
             </div>
           </div>
 
+          {/* Active Repository Status & 1-Click Automation Controls */}
+          <div className="pt-5 pb-5 border-b border-slate-800/80 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+            <div className="space-y-1">
+              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400 font-mono">
+                <span className="text-white font-semibold">
+                  Активный проект: {currentRepo.owner}/{currentRepo.repo}
+                </span>
+                <span aria-hidden="true">·</span>
+                <span>Воркфлоу: .github/workflows/{currentRepo.workflowFile}</span>
+                <span aria-hidden="true">·</span>
+                <span className={currentRepo.autoApkEnabled ? 'text-emerald-400' : 'text-amber-400'}>
+                  {currentRepo.autoApkEnabled ? 'Автосборка APK подключена' : 'Автосборка APK не подключена'}
+                </span>
+                <span aria-hidden="true">·</span>
+                <span className={currentRepo.githubPagesEnabled ? 'text-sky-400' : 'text-slate-500'}>
+                  {currentRepo.githubPagesEnabled ? `Pages: ${currentRepo.pagesUrl}` : 'GitHub Pages выключен'}
+                </span>
+              </div>
+              <p className="text-xs text-slate-400">{currentRepo.description}</p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+              <button
+                type="button"
+                onClick={handleEnableAutoApkForCurrentRepo}
+                className="px-3.5 py-2 text-xs font-medium bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+              >
+                <Smartphone className="w-3.5 h-3.5" />
+                {currentRepo.autoApkEnabled ? 'Обновить автосборку APK (CI/CD)' : 'Подключить автосборку APK в 1 клик'}
+              </button>
+              <button
+                type="button"
+                onClick={handleEnablePagesForCurrentRepo}
+                className="px-3.5 py-2 text-xs font-medium bg-sky-500/15 hover:bg-sky-500/25 text-sky-300 border border-sky-500/30 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+              >
+                <Globe className="w-3.5 h-3.5" />
+                {currentRepo.githubPagesEnabled ? 'GitHub Pages активен' : 'Включить GitHub Pages'}
+              </button>
+            </div>
+          </div>
+
           {/* Interactive Repository Parameters */}
           <div className="pt-5 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
             <div>
@@ -1082,34 +1514,50 @@ jobs:
               <input
                 type="text"
                 value={config.githubOwner}
-                onChange={(e) => setConfig({ ...config, githubOwner: e.target.value })}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setConfig({ ...config, githubOwner: val });
+                  updateCurrentRepo((r) => ({ ...r, owner: val }));
+                }}
                 className="w-full px-3 py-2 text-xs font-mono bg-[#0B0F17] border border-slate-800 rounded-lg text-slate-100 focus:outline-none focus:border-sky-500"
               />
             </div>
             <div>
-              <label className="block text-xs text-slate-400 mb-1.5">Репозиторий игры (GITHUB_REPO)</label>
-              <input
-                type="text"
-                value={config.githubRepo}
-                onChange={(e) => setConfig({ ...config, githubRepo: e.target.value })}
-                className="w-full px-3 py-2 text-xs font-mono bg-[#0B0F17] border border-slate-800 rounded-lg text-slate-100 focus:outline-none focus:border-sky-500"
-              />
+              <label className="block text-xs text-slate-400 mb-1.5">Выбранный репозиторий (GITHUB_REPO)</label>
+              <select
+                value={currentRepo.id}
+                onChange={(e) => handleSelectRepository(e.target.value)}
+                className="w-full px-3 py-2 text-xs font-mono bg-[#0B0F17] border border-slate-800 rounded-lg text-slate-100 focus:outline-none focus:border-sky-500 cursor-pointer"
+              >
+                {repositories.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {r.repo} ({r.autoApkEnabled ? 'CI/CD ON' : 'CI/CD OFF'})
+                  </option>
+                ))}
+              </select>
             </div>
             <div>
               <label className="block text-xs text-slate-400 mb-1.5">Основная ветка (GITHUB_BRANCH)</label>
               <input
                 type="text"
                 value={config.defaultBranch}
-                onChange={(e) => setConfig({ ...config, defaultBranch: e.target.value })}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setConfig({ ...config, defaultBranch: val });
+                  updateCurrentRepo((r) => ({ ...r, defaultBranch: val }));
+                }}
                 className="w-full px-3 py-2 text-xs font-mono bg-[#0B0F17] border border-slate-800 rounded-lg text-slate-100 focus:outline-none focus:border-sky-500"
               />
             </div>
             <div>
-              <label className="block text-xs text-slate-400 mb-1.5">Тип события Dispatch</label>
+              <label className="block text-xs text-slate-400 mb-1.5">Файл Workflow в репо</label>
               <input
                 type="text"
-                value={config.dispatchEvent}
-                onChange={(e) => setConfig({ ...config, dispatchEvent: e.target.value })}
+                value={currentRepo.workflowFile}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  updateCurrentRepo((r) => ({ ...r, workflowFile: val }));
+                }}
                 className="w-full px-3 py-2 text-xs font-mono bg-[#0B0F17] border border-slate-800 rounded-lg text-slate-100 focus:outline-none focus:border-sky-500"
               />
             </div>
@@ -1275,14 +1723,23 @@ jobs:
             <div className="lg:col-span-6 border border-slate-800 bg-[#111827] rounded-xl flex flex-col h-[640px]">
               <div className="px-5 py-4 border-b border-slate-800 flex items-center justify-between gap-4">
                 <div>
-                  <h2 className="text-sm font-semibold text-white">Telegram Чат: @GameApkBuilderBot</h2>
+                  <h2 className="text-sm font-semibold text-white">
+                    Telegram Чат — {currentRepo.owner}/{currentRepo.repo}
+                  </h2>
                   <div className="flex items-center gap-2 text-xs text-slate-400 mt-0.5">
                     <span>Chat ID: {config.chatId}</span>
                     <span aria-hidden="true">·</span>
-                    <span>Авторизован</span>
+                    <span>{currentRepo.autoApkEnabled ? `CI/CD: ${currentRepo.workflowFile}` : 'CI/CD ожидает подключения'}</span>
                   </div>
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-1.5">
+                  <button
+                    onClick={() => handleSendCommand('/repos')}
+                    disabled={isBuilding}
+                    className="px-2.5 py-1.5 text-xs font-mono text-slate-300 bg-slate-800 hover:bg-slate-700 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                  >
+                    /repos
+                  </button>
                   <button
                     onClick={() => handleSendCommand('/status')}
                     disabled={isBuilding}
@@ -1330,7 +1787,7 @@ jobs:
                             onClick={() =>
                               handleDownloadFile(
                                 `${msg.attachment?.filename}.info.txt`,
-                                `APK Build Artifact: ${msg.attachment?.filename}\nCommit: ${msg.attachment?.sha}\nBranch: ${msg.attachment?.branch}\nAuthor: ${msg.attachment?.author}\nSource Backup: ${msg.attachment?.backupArchive}`
+                                `APK Build Artifact: ${msg.attachment?.filename}\nRepository: ${currentRepo.owner}/${currentRepo.repo}\nCommit: ${msg.attachment?.sha}\nBranch: ${msg.attachment?.branch}\nAuthor: ${msg.attachment?.author}\nSource Backup: ${msg.attachment?.backupArchive}`
                               )
                             }
                             className="px-3 py-1.5 text-xs font-medium bg-sky-500/20 text-sky-300 hover:bg-sky-500/30 rounded-md whitespace-nowrap shrink-0 cursor-pointer"
@@ -1365,7 +1822,7 @@ jobs:
                     type="text"
                     value={chatInput}
                     onChange={(e) => setChatInput(e.target.value)}
-                    placeholder="Введите /build main Комментарий или /log Текст..."
+                    placeholder="Введите /build main Комментарий, /repos или /log Текст..."
                     className="flex-1 px-3.5 py-2.5 text-xs font-mono bg-[#0B0F17] border border-slate-800 rounded-lg text-white focus:outline-none focus:border-sky-500"
                   />
                   <button
@@ -1386,14 +1843,14 @@ jobs:
                 <div className="flex items-center justify-between gap-4">
                   <div>
                     <h2 className="text-sm font-semibold text-white">
-                      GitHub Actions Раннер (ubuntu-latest / JDK 17)
+                      GitHub Actions Раннер — {currentRepo.owner}/{currentRepo.repo}
                     </h2>
                     <p className="text-xs text-slate-400 mt-0.5">
-                      Визуализация выполнения шагов <code className="text-slate-200">android_build.yml</code> при вызове <code className="text-sky-400">/build</code>
+                      Воркфлоу <code className="text-slate-200">.github/workflows/{currentRepo.workflowFile}</code> (ветка <code className="text-sky-400">{currentRepo.defaultBranch}</code>)
                     </p>
                   </div>
                   <span className="text-xs font-mono text-slate-300 tabular-nums">
-                    {isBuilding ? 'Сборка выполняется...' : 'Ожидание сигнала'}
+                    {isBuilding ? 'Сборка выполняется...' : currentRepo.autoApkEnabled ? 'Готов к запуску' : 'Требуется настройка'}
                   </span>
                 </div>
 
@@ -1401,8 +1858,8 @@ jobs:
                   {[
                     {
                       step: 1,
-                      title: '1. GitHub Repository Dispatch & Checkout',
-                      detail: `POST /repos/${config.githubOwner}/${config.githubRepo}/dispatches (event_type: ${config.dispatchEvent})`,
+                      title: '1. GitHub Workflow / Repository Dispatch & Checkout',
+                      detail: `POST /repos/${currentRepo.owner}/${currentRepo.repo}/actions/workflows/${currentRepo.workflowFile}/dispatches`,
                     },
                     {
                       step: 2,
@@ -1417,10 +1874,10 @@ jobs:
                     {
                       step: 4,
                       title: '4. Доставка подписанного APK в Telegram и запись в dev_log.md',
-                      detail: 'POST /api/upload-apk (или sendDocument) с информацией о коммите и авторе',
+                      detail: `Отправка APK в чат ${config.chatId} с информацией о коммите и авторе`,
                     },
                   ].map((item) => {
-                    const isDone = !isBuilding ? true : pipelineStep > item.step;
+                    const isDone = !isBuilding ? currentRepo.builds.length > 0 : pipelineStep > item.step;
                     const isCurrent = isBuilding && pipelineStep === item.step;
                     return (
                       <div
@@ -1436,7 +1893,7 @@ jobs:
                         <div className="flex items-center justify-between gap-2">
                           <span className="text-xs font-semibold text-slate-200">{item.title}</span>
                           <span className="text-[11px] font-mono text-slate-400">
-                            {isCurrent ? 'Выполняется...' : isDone ? 'Готово' : 'В очереди'}
+                            {isCurrent ? 'Выполняется...' : isDone ? 'Готово' : 'Ожидание'}
                           </span>
                         </div>
                         <div className="text-[11px] font-mono text-slate-400 mt-1">{item.detail}</div>
@@ -1449,35 +1906,63 @@ jobs:
               {/* Recent Builds Table */}
               <div className="border border-slate-800 bg-[#111827] rounded-xl overflow-hidden">
                 <div className="px-5 py-4 border-b border-slate-800 flex items-center justify-between">
-                  <h3 className="text-sm font-semibold text-white">История собранных APK и .tar.gz бэкапов</h3>
+                  <h3 className="text-sm font-semibold text-white">
+                    История сборок APK: {currentRepo.repo}
+                  </h3>
                   <span className="text-xs text-slate-400 tabular-nums">Всего сборок: {builds.length}</span>
                 </div>
-                <div className="divide-y divide-slate-800">
-                  {builds.map((b) => (
-                    <div key={b.id} className="p-4 hover:bg-slate-800/30 transition-colors space-y-1.5">
-                      <div className="flex items-center justify-between gap-4">
-                        <div className="flex items-center gap-2 text-xs font-medium text-white">
-                          <span className="font-mono text-sky-400 tabular-nums">#{b.id}</span>
-                          <span>·</span>
-                          <span className="font-mono">{b.apkName}</span>
-                          <span>·</span>
-                          <span className="text-slate-400 tabular-nums">{b.apkSize}</span>
-                        </div>
-                        <span className="text-xs text-slate-400 tabular-nums">{b.timestamp}</span>
-                      </div>
-                      <div className="text-xs text-slate-300">{b.message}</div>
-                      <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-400 font-mono">
-                        <span>Коммит: {b.sha}</span>
-                        <span aria-hidden="true">·</span>
-                        <span>Ветка: {b.branch}</span>
-                        <span aria-hidden="true">·</span>
-                        <span>Автор: {b.author}</span>
-                        <span aria-hidden="true">·</span>
-                        <span>Бэкап: {b.backupName}</span>
-                      </div>
+                {builds.length === 0 ? (
+                  <div className="p-6 text-center space-y-3">
+                    <p className="text-xs text-slate-400">
+                      Для репозитория <code className="text-slate-200">{currentRepo.owner}/{currentRepo.repo}</code> сборок еще не запускалось.
+                    </p>
+                    <div className="flex items-center justify-center gap-2.5">
+                      {!currentRepo.autoApkEnabled && (
+                        <button
+                          type="button"
+                          onClick={handleEnableAutoApkForCurrentRepo}
+                          className="px-3.5 py-2 text-xs font-medium bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 rounded-lg transition-colors cursor-pointer"
+                        >
+                          1. Подключить автосборку APK
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => handleSendCommand(`/build ${currentRepo.defaultBranch} Первый релизный билд APK`)}
+                        className="px-3.5 py-2 text-xs font-semibold bg-sky-400 text-slate-950 hover:bg-sky-300 rounded-lg transition-colors cursor-pointer"
+                      >
+                        Запустить первую сборку /build
+                      </button>
                     </div>
-                  ))}
-                </div>
+                  </div>
+                ) : (
+                  <div className="divide-y divide-slate-800">
+                    {builds.map((b) => (
+                      <div key={b.id} className="p-4 hover:bg-slate-800/30 transition-colors space-y-1.5">
+                        <div className="flex items-center justify-between gap-4">
+                          <div className="flex items-center gap-2 text-xs font-medium text-white">
+                            <span className="font-mono text-sky-400 tabular-nums">#{b.id}</span>
+                            <span>·</span>
+                            <span className="font-mono">{b.apkName}</span>
+                            <span>·</span>
+                            <span className="text-slate-400 tabular-nums">{b.apkSize}</span>
+                          </div>
+                          <span className="text-xs text-slate-400 tabular-nums">{b.timestamp}</span>
+                        </div>
+                        <div className="text-xs text-slate-300">{b.message}</div>
+                        <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-400 font-mono">
+                          <span>Коммит: {b.sha}</span>
+                          <span aria-hidden="true">·</span>
+                          <span>Ветка: {b.branch}</span>
+                          <span aria-hidden="true">·</span>
+                          <span>Автор: {b.author}</span>
+                          <span aria-hidden="true">·</span>
+                          <span>Бэкап: {b.backupName}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           </div>
