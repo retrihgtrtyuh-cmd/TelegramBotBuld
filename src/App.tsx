@@ -571,7 +571,8 @@ pydantic==2.9.2
 pydantic-core==2.23.4
 python-dotenv==1.0.1
 requests==2.32.3
-aiohttp==3.10.11`;
+aiohttp==3.10.11
+PyNaCl==1.5.0`;
 
   const renderConfigCode = `# --- Файл 1: .python-version (в корне репозитория) ---
 # Фиксирует Python 3.11.9 на Render, чтобы pydantic-core ставился из готового .whl без компиляции Rust
@@ -627,17 +628,19 @@ CMD ["python", "bot/main.py"]`;
 
   const projectTreeCode = `telegram-bot-deploy/ (Репозиторий Telegram-бота)
 ├── bot/
-│   └── main.py                    # aiogram 3 (личные сообщения + канал -1003962969725) + GET /
-├── requirements.txt               # Зависимости в корне проекта для Render
+│   └── main.py                    # aiogram 3 + мониторинг новых репозиториев + 1-click CI/CD и Pages
+├── bot_config.json                # Создается автоматически: хранит токены и секреты подписи из /setup
+├── known_repos.json               # Создается автоматически: список известных репозиториев GitHub
+├── requirements.txt               # Зависимости (aiogram, aiohttp, PyNaCl для шифрования GitHub Secrets)
 ├── Procfile                       # web: python bot/main.py
 ├── render.yaml                    # Авто-конфигурация Render Blueprint
 ├── .python-version                # 3.11.9 (предотвращает проблемы с Rust/pydantic-core)
 ├── .env.example                   # GITHUB_OWNER="retrihgtrtyuh-cmd", GITHUB_REPO="xianxia-sect-maneger"
-├── .gitignore                     # Исключает .env, __pycache__/
+├── .gitignore                     # Исключает .env, bot_config.json, __pycache__/
 └── dev_log.md                     # Корневой журнал сборок и прогресса
 
 УДАЛЕНО: Папка .github/workflows полностью отсутствует в проекте бота!
-Сборка выполняется на раннерах GitHub Actions в репозитории игры: retrihgtrtyuh-cmd/xianxia-sect-maneger`;
+При подключении нового репозитория бот сам создает .github/workflows/build-and-deploy.yml через GitHub API.`;
 
   const handleCopy = (text: string, id: string) => {
     navigator.clipboard.writeText(text);
