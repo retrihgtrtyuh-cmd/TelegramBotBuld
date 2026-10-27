@@ -1050,34 +1050,85 @@ jobs:
           path: \${{ steps.backup.outputs.archive_name }}
           retention-days: 30
 
-      - name: Установка JDK 17
+      - name: Установка JDK 17 (без cache: 'gradle' для совместимости с веб-проектами)
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
-          cache: 'gradle'
+
+      - name: Установка Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
       - name: Настройка Android SDK
         uses: android-actions/setup-android@v3
 
+      - name: Универсальная проверка проекта (Gradle или Веб-проект AI Studio + Capacitor)
+        run: |
+          if [ -d "android" ] || [ -f "build.gradle" ] || [ -f "build.gradle.kts" ] || [ -f "gradlew" ]; then
+            echo "Обнаружен Android/Gradle проект — собираем напрямую через Gradle."
+          else
+            echo "Файлы Gradle не найдены (веб-проект из AI Studio). Сборка бандла и обертка через Capacitor..."
+            if [ ! -f "package.json" ]; then
+              npm init -y
+            else
+              npm install --legacy-peer-deps || npm install
+              if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1)"; then
+                npm run build
+              fi
+            fi
+            WEB_DIR="dist"
+            if [ -d "dist" ] && [ -f "dist/index.html" ]; then WEB_DIR="dist";
+            elif [ -d "build" ] && [ -f "build/index.html" ]; then WEB_DIR="build";
+            else
+              mkdir -p dist
+              cp -r index.html *.js *.css assets public dist/ 2>/dev/null || true
+            fi
+            npm install @capacitor/core @capacitor/cli @capacitor/android --no-save --legacy-peer-deps
+            RAW_NAME=\$(echo "\${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')
+            SAFE_PKG=\$(echo "\${RAW_NAME:-app}" | sed 's/^[0-9]/app&/')
+            if [ ! -f "capacitor.config.json" ] && [ ! -f "capacitor.config.ts" ]; then
+              npx cap init "\${{ github.event.repository.name }}" "com.aistudio.\${SAFE_PKG}" --web-dir "\$WEB_DIR"
+            fi
+            npx cap add android
+            npx cap sync android
+          fi
+
       - name: 2. Восстановление секретного ключа (.jks) из GitHub Secrets
+        id: keystore
         env:
           KEYSTORE_BASE64: \${{ secrets.KEYSTORE_BASE64 }}
         run: |
-          echo "\$KEYSTORE_BASE64" | base64 --decode > app/release-key.jks
+          if [ -n "\$KEYSTORE_BASE64" ] && [ "\$KEYSTORE_BASE64" != "-" ]; then
+            echo "\$KEYSTORE_BASE64" | base64 --decode > "\$RUNNER_TEMP/release-key.jks"
+            echo "has_keystore=true" >> \$GITHUB_OUTPUT
+          else
+            echo "has_keystore=false" >> \$GITHUB_OUTPUT
+          fi
 
-      - name: Сборка и подпись релизной версии APK (Gradle assembleRelease)
+      - name: Сборка и подпись APK (Gradle)
         env:
           KEYSTORE_PASSWORD: \${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: \${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: \${{ secrets.KEY_PASSWORD }}
         run: |
+          if [ -f "./gradlew" ] || [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            GRADLE_DIR="."
+          else
+            GRADLE_DIR="android"
+          fi
+          cd "\$GRADLE_DIR"
           chmod +x ./gradlew
-          ./gradlew assembleRelease \\
-            -Pandroid.injected.signing.store.file=\$(pwd)/app/release-key.jks \\
-            -Pandroid.injected.signing.store.password="\${KEYSTORE_PASSWORD}" \\
-            -Pandroid.injected.signing.key.alias="\${KEY_ALIAS}" \\
-            -Pandroid.injected.signing.key.password="\${KEY_PASSWORD}"
+          if [ "\${{ steps.keystore.outputs.has_keystore }}" = "true" ] && [ -n "\$KEYSTORE_PASSWORD" ]; then
+            ./gradlew assembleRelease \\
+              -Pandroid.injected.signing.store.file="\$RUNNER_TEMP/release-key.jks" \\
+              -Pandroid.injected.signing.store.password="\${KEYSTORE_PASSWORD}" \\
+              -Pandroid.injected.signing.key.alias="\${KEY_ALIAS}" \\
+              -Pandroid.injected.signing.key.password="\${KEY_PASSWORD}" || ./gradlew assembleDebug
+          else
+            ./gradlew assembleDebug || ./gradlew assembleRelease
+          fi
 
       - name: Извлечение информации о коммите и переименование APK
         id: meta
@@ -1086,7 +1137,7 @@ jobs:
           SHORT_SHA=\$(git rev-parse --short HEAD)
           COMMIT_AUTHOR=\$(git log -1 --pretty=format:'%an (%ae)')
           COMMIT_MSG=\$(git log -1 --pretty=format:'%s')
-          ORIG_APK=\$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          ORIG_APK=\$(find . -path "*/build/outputs/apk/*" -name "*.apk" ! -name "*-unsigned.apk" | head -n 1)
           # Переименование под формат {имя_репозитория}_v{номер_билда}_{короткий_sha}.apk
           RENAMED_APK="\${{ github.event.repository.name }}_v\${{ github.run_number }}_\${SHORT_SHA}.apk"
           cp "\${ORIG_APK}" "./\${RENAMED_APK}"
@@ -1480,31 +1531,108 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Настройка рабочей среды Java (JDK 17)
+      # 2. Настройка рабочей среды Java (JDK 17, без cache: 'gradle')
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
-          cache: 'gradle'
 
-      # 3. Настройка Android SDK
+      # 3. Настройка Node.js (для веб-проектов AI Studio и Capacitor)
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 4. Настройка Android SDK
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      # 4. Предоставление прав на исполнение скрипту Gradle Wrapper
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew
+      # 5. Универсальная проверка: Gradle-проект или веб-проект из AI Studio (Capacitor)
+      - name: Detect Project Type & Prepare Web/Capacitor if needed
+        run: |
+          if [ -d "android" ] || [ -f "build.gradle" ] || [ -f "build.gradle.kts" ] || [ -f "gradlew" ]; then
+            echo "Обнаружен нативный Android/Gradle проект. Сборка напрямую через Gradle."
+          else
+            echo "Файлы Gradle не найдены — это веб-проект из AI Studio. Сборка веб-бандла и обертка в Capacitor..."
+            if [ ! -f "package.json" ]; then
+              npm init -y
+            else
+              npm install --legacy-peer-deps || npm install
+              if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1)"; then
+                npm run build
+              fi
+            fi
 
-      # 5. Сборка APK с помощью Gradle (assembleRelease)
-      - name: Build APK with Gradle
-        run: ./gradlew assembleRelease
+            WEB_DIR="dist"
+            if [ -d "dist" ] && [ -f "dist/index.html" ]; then
+              WEB_DIR="dist"
+            elif [ -d "build" ] && [ -f "build/index.html" ]; then
+              WEB_DIR="build"
+            else
+              mkdir -p dist
+              cp -r index.html *.js *.css assets public dist/ 2>/dev/null || true
+            fi
 
-      # 6. Поиск собранного файла APK, сбор метаданных коммита и переименование
+            npm install @capacitor/core @capacitor/cli @capacitor/android --no-save --legacy-peer-deps || npm install @capacitor/core @capacitor/cli @capacitor/android --no-save
+
+            RAW_NAME=\$(echo "\${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')
+            SAFE_PKG=\$(echo "\${RAW_NAME:-app}" | sed 's/^[0-9]/app&/')
+            APP_ID="com.aistudio.\${SAFE_PKG}"
+
+            if [ ! -f "capacitor.config.json" ] && [ ! -f "capacitor.config.ts" ]; then
+              npx cap init "\${{ github.event.repository.name }}" "\$APP_ID" --web-dir "\$WEB_DIR"
+            fi
+
+            npx cap add android
+            npx cap sync android
+          fi
+
+      # 6. Восстановление Keystore (.jks), если секреты заданы
+      - name: Restore Keystore (.jks) if configured
+        id: keystore
+        env:
+          KEYSTORE_BASE64: \${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "\$KEYSTORE_BASE64" ] && [ "\$KEYSTORE_BASE64" != "-" ]; then
+            echo "\$KEYSTORE_BASE64" | base64 --decode > "\$RUNNER_TEMP/release-key.jks"
+            echo "has_keystore=true" >> \$GITHUB_OUTPUT
+          else
+            echo "has_keystore=false" >> \$GITHUB_OUTPUT
+          fi
+
+      # 7. Сборка и подпись APK с помощью Gradle
+      - name: Build & Sign APK with Gradle
+        env:
+          KEYSTORE_PASSWORD: \${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: \${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: \${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -f "./gradlew" ] || [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            GRADLE_DIR="."
+          else
+            GRADLE_DIR="android"
+          fi
+          cd "\$GRADLE_DIR"
+          chmod +x ./gradlew
+          if [ "\${{ steps.keystore.outputs.has_keystore }}" = "true" ] && [ -n "\$KEYSTORE_PASSWORD" ]; then
+            ./gradlew assembleRelease \\
+              -Pandroid.injected.signing.store.file="\$RUNNER_TEMP/release-key.jks" \\
+              -Pandroid.injected.signing.store.password="\${KEYSTORE_PASSWORD}" \\
+              -Pandroid.injected.signing.key.alias="\${KEY_ALIAS}" \\
+              -Pandroid.injected.signing.key.password="\${KEY_PASSWORD}" || ./gradlew assembleDebug
+          else
+            ./gradlew assembleDebug || ./gradlew assembleRelease
+          fi
+
+      # 8. Поиск собранного файла APK, сбор метаданных коммита и переименование
       - name: Locate & Rename compiled APK
         id: locate_apk
         run: |
-          APK_FILE=\$(find . -path "*/build/outputs/apk/*" -name "*.apk" | head -n 1)
+          APK_FILE=\$(find . -path "*/build/outputs/apk/*" -name "*.apk" ! -name "*-unsigned.apk" | head -n 1)
+          if [ -z "\$APK_FILE" ]; then
+            APK_FILE=\$(find . -path "*/build/outputs/apk/*" -name "*.apk" | head -n 1)
+          fi
           if [ -z "\$APK_FILE" ]; then
             echo "::error::APK файл не найден в директориях build/outputs/apk/"
             exit 1
