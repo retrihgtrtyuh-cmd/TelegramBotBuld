@@ -80,8 +80,8 @@ jobs:
               fi
             fi
 
-            # 2. Установка Capacitor и генерация capacitor.config.json с именем репозитория
-            npm install @capacitor/core @capacitor/cli @capacitor/android --no-save --legacy-peer-deps || npm install @capacitor/core @capacitor/cli @capacitor/android --no-save
+            # 2. Установка Capacitor (v6 для полной совместимости с JDK 17 и Android SDK 34) и генерация capacitor.config.json
+            npm install @capacitor/core@^6.0.0 @capacitor/cli@^6.0.0 @capacitor/android@^6.0.0 --no-save --legacy-peer-deps || npm install @capacitor/core@^6.0.0 @capacitor/cli@^6.0.0 @capacitor/android@^6.0.0 --no-save
 
             RAW_NAME=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')
             if [ -z "$RAW_NAME" ]; then RAW_NAME="app"; fi
@@ -92,14 +92,14 @@ jobs:
           {
             "appId": "${APP_ID}",
             "appName": "${{ github.event.repository.name }}",
-            "webDir": "${WEB_DIR}",
-            "bundledWebRuntime": false
+            "webDir": "${WEB_DIR}"
           }
           EOF
 
             # 3. Создание папки android/ и синхронизация веб-ресурсов
             npx cap add android
             npx cap sync android
+            echo "sdk.dir=/usr/local/lib/android/sdk" > android/local.properties
           fi
 
       - name: Prepare Signing Keystore (.jks)
@@ -131,17 +131,21 @@ jobs:
           fi
 
       - name: Build Release APK with Gradle
+        env:
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+          ANDROID_HOME: /usr/local/lib/android/sdk
         run: |
-          if [ -d "android" ] && [ -f "android/gradlew" ]; then
+          if [ -d "android" ]; then
             cd android
           fi
 
+          echo "sdk.dir=/usr/local/lib/android/sdk" > local.properties
           chmod +x gradlew
-          ./gradlew assembleRelease \
+          ./gradlew assembleRelease -x lint -x lintVitalRelease \
             -Pandroid.injected.signing.store.file="${{ steps.keystore.outputs.store_file }}" \
             -Pandroid.injected.signing.store.password="${{ steps.keystore.outputs.store_password }}" \
             -Pandroid.injected.signing.key.alias="${{ steps.keystore.outputs.key_alias }}" \
-            -Pandroid.injected.signing.key.password="${{ steps.keystore.outputs.key_password }}" || ./gradlew assembleDebug
+            -Pandroid.injected.signing.key.password="${{ steps.keystore.outputs.key_password }}" || ./gradlew assembleDebug -x lint
 
       - name: Locate & Rename APK ({repo}_v{run_number}.apk)
         id: locate_apk

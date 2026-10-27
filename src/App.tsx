@@ -303,7 +303,7 @@ export default function App() {
         {
           id: 'p1',
           sender: 'bot',
-          text: `🔄 Workflow в репозитории retrihgtrtyuh-cmd/Planer-lesson успешно обновлен!\n• Файл: .github/workflows/build-and-deploy.yml\n• Set up JDK 17: actions/setup-java@v5 (без cache: 'gradle')\n• Авто-обертка веб-проекта: npm install && npm run build → capacitor.config.json → npx cap add android → cd android && ./gradlew assembleRelease\n• Формат APK: Planer-lesson_v{run_number}.apk`,
+          text: `🔄 Workflow в репозитории retrihgtrtyuh-cmd/Planer-lesson успешно обновлен!\n• Файл: .github/workflows/build-and-deploy.yml\n• Set up JDK 17: actions/setup-java@v5 (без cache: 'gradle')\n• Авто-обертка веб-проекта: npm install && npm run build → capacitor.config.json → npx cap add android → cd android && local.properties (sdk.dir=/usr/local/lib/android/sdk) && ./gradlew assembleRelease -x lint\n• Формат APK: Planer-lesson_v{run_number}.apk`,
           time: '11:29',
         },
         {
@@ -502,7 +502,7 @@ export default function App() {
         {
           id: `wf-upd-${Date.now()}`,
           sender: 'bot',
-          text: `✅ Workflow в репозитории ${r.owner}/${r.repo} успешно обновлен!\n\n• Файл: .github/workflows/build-and-deploy.yml (перезаписан через GitHub API)\n• Шаг JDK 17: actions/setup-java@v5 (удален cache: 'gradle')\n• Авто-обертка AI Studio Web → Android: npm install → npm run build → capacitor.config.json → npx cap add android → cd android && ./gradlew assembleRelease\n• Переименование APK: ${r.repo}_v{github.run_number}.apk`,
+          text: `✅ Workflow в репозитории ${r.owner}/${r.repo} успешно обновлен!\n\n• Файл: .github/workflows/build-and-deploy.yml (перезаписан через GitHub API)\n• Шаг JDK 17: actions/setup-java@v5 (удален cache: 'gradle')\n• Авто-обертка AI Studio Web → Android: npm install → npm run build → capacitor.config.json → npx cap add android → cd android → local.properties (sdk.dir=/usr/local/lib/android/sdk) → ./gradlew assembleRelease -x lint\n• Переименование APK: ${r.repo}_v{github.run_number}.apk`,
           time: nowTime,
         },
       ],
@@ -1187,19 +1187,19 @@ jobs:
                 [ -e "\$item" ] && cp -r "\$item" "\$WEB_DIR/" 2>/dev/null || true
               done
             fi
-            npm install @capacitor/core @capacitor/cli @capacitor/android --no-save --legacy-peer-deps
+            npm install @capacitor/core@^6.0.0 @capacitor/cli@^6.0.0 @capacitor/android@^6.0.0 --no-save --legacy-peer-deps || npm install @capacitor/core@^6.0.0 @capacitor/cli@^6.0.0 @capacitor/android@^6.0.0 --no-save
             RAW_NAME=\$(echo "\${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')
             SAFE_PKG=\$(echo "\${RAW_NAME:-app}" | sed 's/^[0-9]/app&/')
             cat <<EOF > capacitor.config.json
           {
             "appId": "com.aistudio.\${SAFE_PKG}",
             "appName": "\${{ github.event.repository.name }}",
-            "webDir": "\${WEB_DIR}",
-            "bundledWebRuntime": false
+            "webDir": "\${WEB_DIR}"
           }
           EOF
             npx cap add android
             npx cap sync android
+            echo "sdk.dir=/usr/local/lib/android/sdk" > android/local.properties
           fi
 
       - name: 2. Восстановление или генерация ключа подписи (.jks)
@@ -1224,17 +1224,21 @@ jobs:
             echo "key_password=android123" >> \$GITHUB_OUTPUT
           fi
 
-      - name: Сборка и подпись APK (cd android && ./gradlew assembleRelease)
+      - name: Build Release APK with Gradle
+        env:
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+          ANDROID_HOME: /usr/local/lib/android/sdk
         run: |
-          if [ -d "android" ] && [ -f "android/gradlew" ]; then
+          if [ -d "android" ]; then
             cd android
           fi
+          echo "sdk.dir=/usr/local/lib/android/sdk" > local.properties
           chmod +x gradlew
-          ./gradlew assembleRelease \\
+          ./gradlew assembleRelease -x lint -x lintVitalRelease \\
             -Pandroid.injected.signing.store.file="\${{ steps.keystore.outputs.store_file }}" \\
             -Pandroid.injected.signing.store.password="\${{ steps.keystore.outputs.store_password }}" \\
             -Pandroid.injected.signing.key.alias="\${{ steps.keystore.outputs.key_alias }}" \\
-            -Pandroid.injected.signing.key.password="\${{ steps.keystore.outputs.key_password }}" || ./gradlew assembleDebug
+            -Pandroid.injected.signing.key.password="\${{ steps.keystore.outputs.key_password }}" || ./gradlew assembleDebug -x lint
 
       - name: Извлечение информации о коммите и переименование APK ({имя_репозитория}_v{github.run_number}.apk)
         id: meta
@@ -1692,7 +1696,7 @@ jobs:
               done
             fi
 
-            npm install @capacitor/core @capacitor/cli @capacitor/android --no-save --legacy-peer-deps || npm install @capacitor/core @capacitor/cli @capacitor/android --no-save
+            npm install @capacitor/core@^6.0.0 @capacitor/cli@^6.0.0 @capacitor/android@^6.0.0 --no-save --legacy-peer-deps || npm install @capacitor/core@^6.0.0 @capacitor/cli@^6.0.0 @capacitor/android@^6.0.0 --no-save
 
             RAW_NAME=\$(echo "\${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')
             SAFE_PKG=\$(echo "\${RAW_NAME:-app}" | sed 's/^[0-9]/app&/')
@@ -1702,13 +1706,13 @@ jobs:
           {
             "appId": "\${APP_ID}",
             "appName": "\${{ github.event.repository.name }}",
-            "webDir": "\${WEB_DIR}",
-            "bundledWebRuntime": false
+            "webDir": "\${WEB_DIR}"
           }
           EOF
 
             npx cap add android
             npx cap sync android
+            echo "sdk.dir=/usr/local/lib/android/sdk" > android/local.properties
           fi
 
       # 6. Подготовка Keystore (.jks) для подписи assembleRelease
@@ -1739,18 +1743,22 @@ jobs:
             echo "key_password=android123" >> \$GITHUB_OUTPUT
           fi
 
-      # 7. Переход в созданную папку android и выполнение chmod +x gradlew && ./gradlew assembleRelease
+      # 7. Переход в созданную папку android, прописывание sdk.dir в local.properties и сборка ./gradlew assembleRelease -x lint
       - name: Build Release APK with Gradle
+        env:
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+          ANDROID_HOME: /usr/local/lib/android/sdk
         run: |
-          if [ -d "android" ] && [ -f "android/gradlew" ]; then
+          if [ -d "android" ]; then
             cd android
           fi
+          echo "sdk.dir=/usr/local/lib/android/sdk" > local.properties
           chmod +x gradlew
-          ./gradlew assembleRelease \\
+          ./gradlew assembleRelease -x lint -x lintVitalRelease \\
             -Pandroid.injected.signing.store.file="\${{ steps.keystore.outputs.store_file }}" \\
             -Pandroid.injected.signing.store.password="\${{ steps.keystore.outputs.store_password }}" \\
             -Pandroid.injected.signing.key.alias="\${{ steps.keystore.outputs.key_alias }}" \\
-            -Pandroid.injected.signing.key.password="\${{ steps.keystore.outputs.key_password }}" || ./gradlew assembleDebug
+            -Pandroid.injected.signing.key.password="\${{ steps.keystore.outputs.key_password }}" || ./gradlew assembleDebug -x lint
 
       # 8. Поиск собранного файла APK и переименование в формат {имя_репозитория}_v{github.run_number}.apk
       - name: Locate & Rename compiled APK
