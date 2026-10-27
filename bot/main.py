@@ -183,12 +183,12 @@ def append_to_dev_log(entry: str) -> None:
 
 def generate_workflow_yaml() -> str:
     """
-    Генерирует универсальный файл .github/workflows/build-and-deploy.yml.
-    Поддерживает:
-    1) Нативные Android-репозитории (с папкой android/ или build.gradle).
-    2) Веб-репозитории из AI Studio (HTML/JS/React/Vite без Gradle) — автоматически собирает веб-бандл
-       и оборачивает в Android-проект через Capacitor (npx cap add android).
-    3) Подпись APK ключом .jks (если секреты заданы) и отправку переименованного APK в Telegram.
+    Генерирует универсальный файл .github/workflows/build-and-deploy.yml для любых проектов из AI Studio.
+    1) В Set up JDK 17 использует actions/setup-java@v5 БЕЗ cache: 'gradle'.
+    2) Если папки android и файла gradlew нет — устанавливает Node.js, собирает веб-бандл (npm install && npm run build
+       или корневой index.html), создает capacitor.config.json с именем репозитория, выполняет npx cap add android,
+       переходит в папку android и собирает APK через ./gradlew assembleRelease.
+    3) Переименовывает готовый APK в формат {имя_репозитория}_v{github.run_number}.apk перед отправкой в Telegram.
     """
     return """name: Build & Deploy Android APK to Telegram
 
@@ -214,7 +214,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'
@@ -227,27 +227,25 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Detect Project Type & Prepare Web/Capacitor if needed
-        id: project_check
+      - name: Prepare Web Project & Wrap with Capacitor (if no android/ or gradlew)
         run: |
-          if [ -d "android" ] || [ -f "build.gradle" ] || [ -f "build.gradle.kts" ] || [ -f "gradlew" ]; then
-            echo "Обнаружен нативный Android/Gradle проект. Сборка напрямую через Gradle."
-            echo "is_web_wrapped=false" >> $GITHUB_OUTPUT
+          if [ -d "android" ] || [ -f "gradlew" ] || [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            echo "Обнаружен существующий Android/Gradle проект — шаг обертки Capacitor не требуется."
           else
-            echo "Файлы Gradle не найдены — это веб-проект (AI Studio / React / Vite / HTML). Собираем веб-бандл и оборачиваем в Capacitor..."
-            echo "is_web_wrapped=true" >> $GITHUB_OUTPUT
+            echo "Папка android/ и gradlew не найдены. Обнаружен веб-проект (AI Studio) — выполняем сборку и обертку в Android через Capacitor..."
 
+            # 1. Установка зависимостей и сборка веб-бандла
             if [ ! -f "package.json" ]; then
               npm init -y
             else
               npm install --legacy-peer-deps || npm install
-              if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1)"; then
-                npm run build
-              fi
             fi
 
-            # Определяем папку с собранным веб-бандлом
-            WEB_DIR="dist"
+            WEB_DIR="www_bundle"
+            if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1)" 2>/dev/null; then
+              npm run build
+            fi
+
             if [ -d "dist" ] && [ -f "dist/index.html" ]; then
               WEB_DIR="dist"
             elif [ -d "build" ] && [ -f "build/index.html" ]; then
@@ -255,15 +253,19 @@ jobs:
             elif [ -d "www" ] && [ -f "www/index.html" ]; then
               WEB_DIR="www"
             else
-              mkdir -p dist
-              cp -r index.html *.js *.css assets public dist/ 2>/dev/null || true
-              if [ ! -f "dist/index.html" ]; then
-                echo "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>${{ github.event.repository.name }}</title></head><body><h1>${{ github.event.repository.name }}</h1></body></html>" > dist/index.html
+              # Если нет скрипта build — используем корневую папку с index.html
+              mkdir -p "$WEB_DIR"
+              for item in index.html *.html *.js *.css *.json *.png *.svg *.ico assets public src styles; do
+                if [ -e "$item" ] && [ "$item" != "package.json" ] && [ "$item" != "package-lock.json" ] && [ "$item" != "tsconfig.json" ]; then
+                  cp -r "$item" "$WEB_DIR/" 2>/dev/null || true
+                fi
+              done
+              if [ ! -f "$WEB_DIR/index.html" ]; then
+                echo "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>${{ github.event.repository.name }}</title></head><body><h1>${{ github.event.repository.name }}</h1></body></html>" > "$WEB_DIR/index.html"
               fi
-              WEB_DIR="dist"
             fi
 
-            # Устанавливаем Capacitor и создаем Android-проект
+            # 2. Автоматическая инициализация Capacitor и создание capacitor.config.json с именем репозитория
             npm install @capacitor/core @capacitor/cli @capacitor/android --no-save --legacy-peer-deps || npm install @capacitor/core @capacitor/cli @capacitor/android --no-save
 
             RAW_NAME=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')
@@ -271,60 +273,61 @@ jobs:
             SAFE_PKG=$(echo "$RAW_NAME" | sed 's/^[0-9]/app&/')
             APP_ID="com.aistudio.${SAFE_PKG}"
 
-            if [ ! -f "capacitor.config.json" ] && [ ! -f "capacitor.config.ts" ]; then
-              npx cap init "${{ github.event.repository.name }}" "$APP_ID" --web-dir "$WEB_DIR"
-            fi
+            cat <<EOF > capacitor.config.json
+          {
+            "appId": "${APP_ID}",
+            "appName": "${{ github.event.repository.name }}",
+            "webDir": "${WEB_DIR}",
+            "bundledWebRuntime": false
+          }
+          EOF
 
+            # 3. Создание папки android и синхронизация
             npx cap add android
             npx cap sync android
           fi
 
-      - name: Restore Keystore (.jks) if configured
+      - name: Prepare Signing Keystore (.jks)
         id: keystore
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-        run: |
-          if [ -n "$KEYSTORE_BASE64" ] && [ "$KEYSTORE_BASE64" != "-" ]; then
-            echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release-key.jks"
-            echo "has_keystore=true" >> $GITHUB_OUTPUT
-          else
-            echo "has_keystore=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Build & Sign APK with Gradle
-        env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          if [ -f "./gradlew" ] || [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
-            GRADLE_DIR="."
-          elif [ -d "android" ]; then
-            GRADLE_DIR="android"
+          if [ -n "$KEYSTORE_BASE64" ] && [ "$KEYSTORE_BASE64" != "-" ] && [ -n "$KEYSTORE_PASSWORD" ]; then
+            echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release-key.jks"
+            echo "store_file=$RUNNER_TEMP/release-key.jks" >> $GITHUB_OUTPUT
+            echo "store_password=$KEYSTORE_PASSWORD" >> $GITHUB_OUTPUT
+            echo "key_alias=$KEY_ALIAS" >> $GITHUB_OUTPUT
+            echo "key_password=$KEY_PASSWORD" >> $GITHUB_OUTPUT
           else
-            echo "::error::Папка Gradle-проекта не найдена!"
-            exit 1
+            keytool -genkeypair -v \\
+              -keystore "$RUNNER_TEMP/release-key.jks" \\
+              -alias release_key \\
+              -keyalg RSA -keysize 2048 -validity 10000 \\
+              -storepass android123 -keypass android123 \\
+              -dname "CN=AIStudio, OU=Mobile, O=AIStudio, L=City, S=State, C=US"
+            echo "store_file=$RUNNER_TEMP/release-key.jks" >> $GITHUB_OUTPUT
+            echo "store_password=android123" >> $GITHUB_OUTPUT
+            echo "key_alias=release_key" >> $GITHUB_OUTPUT
+            echo "key_password=android123" >> $GITHUB_OUTPUT
           fi
 
-          cd "$GRADLE_DIR"
-          if [ -f "./gradlew" ]; then
-            chmod +x ./gradlew
-            GRADLE_CMD="./gradlew"
-          else
-            GRADLE_CMD="gradle"
+      - name: Build Release APK with Gradle
+        run: |
+          if [ -d "android" ] && [ -f "android/gradlew" ]; then
+            cd android
           fi
 
-          if [ "${{ steps.keystore.outputs.has_keystore }}" = "true" ] && [ -n "$KEYSTORE_PASSWORD" ]; then
-            $GRADLE_CMD assembleRelease \\
-              -Pandroid.injected.signing.store.file="$RUNNER_TEMP/release-key.jks" \\
-              -Pandroid.injected.signing.store.password="${KEYSTORE_PASSWORD}" \\
-              -Pandroid.injected.signing.key.alias="${KEY_ALIAS}" \\
-              -Pandroid.injected.signing.key.password="${KEY_PASSWORD}" || $GRADLE_CMD assembleDebug
-          else
-            $GRADLE_CMD assembleDebug || $GRADLE_CMD assembleRelease
-          fi
+          chmod +x gradlew
+          ./gradlew assembleRelease \\
+            -Pandroid.injected.signing.store.file="${{ steps.keystore.outputs.store_file }}" \\
+            -Pandroid.injected.signing.store.password="${{ steps.keystore.outputs.store_password }}" \\
+            -Pandroid.injected.signing.key.alias="${{ steps.keystore.outputs.key_alias }}" \\
+            -Pandroid.injected.signing.key.password="${{ steps.keystore.outputs.key_password }}" || ./gradlew assembleDebug
 
-      - name: Locate compiled APK & Commit Info
+      - name: Locate & Rename APK ({repo}_v{run_number}.apk)
         id: locate_apk
         run: |
           APK_FILE=$(find . -path "*/build/outputs/apk/*" -name "*.apk" ! -name "*-unsigned.apk" | head -n 1)
@@ -336,7 +339,7 @@ jobs:
             exit 1
           fi
           SHORT_SHA=$(git rev-parse --short HEAD)
-          RENAMED_APK="${{ github.event.repository.name }}_v${{ github.run_number }}_${SHORT_SHA}.apk"
+          RENAMED_APK="${{ github.event.repository.name }}_v${{ github.run_number }}.apk"
           cp "$APK_FILE" "./$RENAMED_APK"
           echo "apk_path=./$RENAMED_APK" >> $GITHUB_OUTPUT
           echo "apk_filename=$RENAMED_APK" >> $GITHUB_OUTPUT
@@ -356,7 +359,7 @@ jobs:
           COMMIT_MSG: ${{ steps.locate_apk.outputs.commit_msg }}
           AUTHOR: ${{ steps.locate_apk.outputs.author }}
         run: |
-          RENAMED_APK="${REPO_NAME}_v${RUN_NUM}_${SHORT_SHA}.apk"
+          RENAMED_APK="${REPO_NAME}_v${RUN_NUM}.apk"
           if [ "$APK_PATH" != "./$RENAMED_APK" ] && [ -f "$APK_PATH" ]; then
             cp "$APK_PATH" "./$RENAMED_APK"
           fi
@@ -369,7 +372,7 @@ jobs:
 
       - name: Cleanup Keystore & Temp APK
         if: always()
-        run: rm -f "$RUNNER_TEMP/release-key.jks" app/release-key.jks ./*_v*_*.apk
+        run: rm -f "$RUNNER_TEMP/release-key.jks" app/release-key.jks ./*_v*.apk
 """
 
 
@@ -648,6 +651,12 @@ def get_new_repo_card_keyboard(repo_name: str, is_new_notification: bool = False
     rows = [
         [
             InlineKeyboardButton(
+                text="🔄 Обновить workflow в репозитории",
+                callback_data=f"repo_update_wf:{repo_name}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
                 text="📱 Подключить автосборку APK (CI/CD)",
                 callback_data=f"repo_apk:{repo_name}"
             )
@@ -712,6 +721,12 @@ def get_repo_action_result_keyboard(repo_name: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="🚀 Запустить сборку APK сейчас",
                     callback_data=f"repo_build_now:{repo_name}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔄 Обновить workflow в репозитории",
+                    callback_data=f"repo_update_wf:{repo_name}"
                 )
             ],
             [
@@ -1005,6 +1020,12 @@ def get_start_inline_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="📊 Статус Actions", callback_data="cb_status"),
             ],
             [
+                InlineKeyboardButton(
+                    text="🔄 Обновить workflow в репозитории",
+                    callback_data=f"repo_update_wf:{repo}"
+                )
+            ],
+            [
                 InlineKeyboardButton(text="🔍 Проверить новые репо", callback_data="cb_check_repos"),
                 InlineKeyboardButton(text="⚙️ Настроить токен / ключи", callback_data="cb_setup_menu"),
             ],
@@ -1228,10 +1249,16 @@ async def get_status_text(repo_override: str = None) -> tuple[str, InlineKeyboar
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
+                text="🔄 Обновить workflow в репозитории",
+                callback_data=f"repo_update_wf:{repo}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
                 text="🌐 Открыть на GitHub",
                 url=latest.get("html_url", f"https://github.com/{owner}/{repo}/actions")
             ),
-            InlineKeyboardButton(text="🔄 Обновить", callback_data=refresh_cb)
+            InlineKeyboardButton(text="🔄 Обновить статус", callback_data=refresh_cb)
         ],
         back_row
     ])
@@ -1667,6 +1694,46 @@ async def callback_setup_field(call: CallbackQuery):
 # КНОПКИ КАРТОЧКИ РЕПОЗИТОРИЯ: [📱 APK] [🌐 Pages] [❌ Пропустить]
 # ---------------------------------------------------------------------
 
+@router.callback_query(F.data.startswith("repo_update_wf:"))
+async def callback_repo_update_wf(call: CallbackQuery):
+    """Перезаписывает .github/workflows/build-and-deploy.yml в выбранном репозитории (например, Planer-lesson)."""
+    repo_name = call.data.split(":", 1)[1]
+    chat_id = call.message.chat.id
+    cfg = load_bot_config()
+    owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
+    token = cfg.get("github_pat", "")
+
+    if not token:
+        await call.answer("Нужен GitHub токен!", show_alert=True)
+        await prompt_for_missing_token(chat_id, pending_action="update_wf", repo_name=repo_name)
+        return
+
+    await call.answer(f"Обновляю workflow в {repo_name}...")
+    wait_msg = await call.message.answer(
+        f"🔄 <b>Перезаписываю workflow в <code>{owner}/{repo_name}</code>...</b>\n"
+        f"• Установка <code>actions/setup-java@v5</code> (без <code>cache: 'gradle'</code>)\n"
+        f"• Авто-обертка веб-проектов AI Studio через Capacitor (<code>npx cap add android</code>)\n"
+        f"• Переименование APK в <code>{repo_name}_v{{run_number}}.apk</code>"
+    )
+
+    ok, details = await setup_auto_apk_for_repo(owner, repo_name, chat_id)
+    res_kb = get_repo_action_result_keyboard(repo_name)
+    if ok:
+        await wait_msg.edit_text(
+            f"✅ <b>Workflow в репозитории <code>{owner}/{repo_name}</code> успешно обновлен!</b>\n\n"
+            f"• <b>Файл:</b> <code>.github/workflows/build-and-deploy.yml</code>\n"
+            f"• <b>Исправления:</b> <code>setup-java@v5</code> без кэша Gradle + Capacitor Android-обертка для веб-приложений + переименование <code>{repo_name}_v{{run_number}}.apk</code>\n"
+            f"• <b>Секреты:</b> {details}\n\n"
+            f"Нажмите кнопку ниже, чтобы сразу запустить новую сборку APK:",
+            reply_markup=res_kb
+        )
+    else:
+        await wait_msg.edit_text(
+            f"❌ <b>Не удалось обновить workflow в {owner}/{repo_name}:</b>\n<code>{details}</code>",
+            reply_markup=res_kb
+        )
+
+
 @router.callback_query(F.data.startswith("repo_apk:"))
 async def callback_repo_apk(call: CallbackQuery):
     repo_name = call.data.split(":", 1)[1]
@@ -1826,14 +1893,15 @@ async def handle_interactive_input(message: Message):
     # Если ввод токена был запрошен во время нажатия кнопки на карточке нового репозитория — сразу продолжаем!
     cfg = load_bot_config()
     owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
-    if pending_action == "apk" and repo_name:
+    if pending_action in ("apk", "update_wf") and repo_name:
         res_kb = get_repo_action_result_keyboard(repo_name)
-        wait_msg = await message.answer(f"⏳ Продолжаю настройку автосборки APK для <code>{owner}/{repo_name}</code>...")
+        wait_msg = await message.answer(f"⏳ Обновляю workflow и секреты автосборки APK для <code>{owner}/{repo_name}</code>...")
         ok, details = await setup_auto_apk_for_repo(owner, repo_name, chat_id)
         if ok:
             await wait_msg.edit_text(
-                f"✅ <b>Автосборка настроена! Следующий пуш соберет APK</b>\n\n"
+                f"✅ <b>Workflow в репозитории <code>{owner}/{repo_name}</code> обновлен! Следующий пуш соберет APK</b>\n\n"
                 f"• <b>Репозиторий:</b> <code>{owner}/{repo_name}</code>\n"
+                f"• <b>Воркфлоу:</b> <code>.github/workflows/build-and-deploy.yml</code> (<code>setup-java@v5</code> + Capacitor)\n"
                 f"• <b>Статус секретов:</b> {details}",
                 reply_markup=res_kb
             )
@@ -1914,7 +1982,7 @@ async def handle_upload_apk(request: web.Request) -> web.Response:
     repo_name = meta["repo_name"] or cfg.get("github_repo", "xianxia-sect-maneger")
     build_num = meta["build_number"]
     if not apk_filename or apk_filename == "app-release.apk":
-        apk_filename = f"{repo_name}_v{build_num}_{short_sha}.apk"
+        apk_filename = f"{repo_name}_v{build_num}.apk"
 
     caption = (
         f"📦 <b>Сборка APK готова!</b>\n\n"

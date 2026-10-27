@@ -273,6 +273,62 @@ export default function App() {
         },
       ],
     },
+    {
+      id: 'Planer-lesson',
+      owner: 'retrihgtrtyuh-cmd',
+      repo: 'Planer-lesson',
+      description: 'Веб-проект из AI Studio (Node.js / Vite / React / HTML) с автоматической оберткой в Android через Capacitor',
+      defaultBranch: 'main',
+      workflowFile: 'build-and-deploy.yml',
+      dispatchEvent: 'build_apk',
+      autoApkEnabled: true,
+      githubPagesEnabled: true,
+      pagesUrl: 'https://retrihgtrtyuh-cmd.github.io/Planer-lesson/',
+      builds: [
+        {
+          id: 2,
+          sha: '7b3e91a',
+          branch: 'main',
+          author: 'retrihgtrtyuh-cmd',
+          message: 'ci: update build-and-deploy.yml (setup-java@v5 without gradle cache + Capacitor Android wrapper)',
+          trigger: 'workflow_dispatch',
+          status: 'completed',
+          apkName: 'Planer-lesson_v2.apk',
+          apkSize: '18.6 MB',
+          backupName: 'backup_7b3e91a_20261027_1130.tar.gz',
+          timestamp: '2026-10-27 11:30 UTC',
+        },
+      ],
+      messages: [
+        {
+          id: 'p1',
+          sender: 'bot',
+          text: `🔄 Workflow в репозитории retrihgtrtyuh-cmd/Planer-lesson успешно обновлен!\n• Файл: .github/workflows/build-and-deploy.yml\n• Set up JDK 17: actions/setup-java@v5 (без cache: 'gradle')\n• Авто-обертка веб-проекта: npm install && npm run build → capacitor.config.json → npx cap add android → cd android && ./gradlew assembleRelease\n• Формат APK: Planer-lesson_v{run_number}.apk`,
+          time: '11:29',
+        },
+        {
+          id: 'p2',
+          sender: 'bot',
+          text: `📦 Сборка APK готова!\n• Проект: Planer-lesson\n• Номер сборки: #2 (v2)\n• Файл: Planer-lesson_v2.apk\n• Коммит: 7b3e91a — ci: update build-and-deploy.yml (setup-java@v5 + Capacitor)`,
+          time: '11:30',
+          attachment: {
+            filename: 'Planer-lesson_v2.apk',
+            size: '18.6 MB',
+            backupArchive: 'backup_7b3e91a_20261027_1130.tar.gz',
+            sha: '7b3e91a',
+            branch: 'main',
+            author: 'retrihgtrtyuh-cmd',
+          },
+        },
+      ],
+      devLogEntries: [
+        {
+          date: '2026-10-27 11:30 UTC',
+          tag: 'Workflow Updated',
+          content: '[Planer-lesson] Перезаписан .github/workflows/build-and-deploy.yml: actions/setup-java@v5 без cache: gradle, авто-обертка Capacitor (npx cap add android) и сборка Planer-lesson_v2.apk.',
+        },
+      ],
+    },
   ]);
 
   const [selectedRepoId, setSelectedRepoId] = useState<string>('xianxia-sect-maneger');
@@ -430,6 +486,43 @@ export default function App() {
         },
         ...r.devLogEntries,
       ],
+    }));
+  };
+
+  // 1-Click Overwrite/Update workflow in current repository (e.g., Planer-lesson)
+  const handleUpdateWorkflowInCurrentRepo = () => {
+    const nowTime = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+    const ts = new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+    updateCurrentRepo((r) => ({
+      ...r,
+      autoApkEnabled: true,
+      workflowFile: 'build-and-deploy.yml',
+      messages: [
+        ...r.messages,
+        {
+          id: `wf-upd-${Date.now()}`,
+          sender: 'bot',
+          text: `✅ Workflow в репозитории ${r.owner}/${r.repo} успешно обновлен!\n\n• Файл: .github/workflows/build-and-deploy.yml (перезаписан через GitHub API)\n• Шаг JDK 17: actions/setup-java@v5 (удален cache: 'gradle')\n• Авто-обертка AI Studio Web → Android: npm install → npm run build → capacitor.config.json → npx cap add android → cd android && ./gradlew assembleRelease\n• Переименование APK: ${r.repo}_v{github.run_number}.apk`,
+          time: nowTime,
+        },
+      ],
+      devLogEntries: [
+        {
+          date: ts,
+          tag: 'Workflow Overwritten',
+          content: `[${r.repo}] Перезаписан .github/workflows/build-and-deploy.yml (setup-java@v5 без cache: 'gradle' + обертка Capacitor для веб-проектов AI Studio).`,
+        },
+        ...r.devLogEntries,
+      ],
+    }));
+    setRepoActionsStatus((prev) => ({
+      ...prev,
+      [currentRepo.id]: {
+        ...getEffectiveActionsStatus(currentRepo),
+        label: 'Success',
+        workflowName: 'build-and-deploy.yml',
+        updatedAt: ts,
+      },
     }));
   };
 
@@ -1050,87 +1143,93 @@ jobs:
           path: \${{ steps.backup.outputs.archive_name }}
           retention-days: 30
 
-      - name: Установка JDK 17 (без cache: 'gradle' для совместимости с веб-проектами)
-        uses: actions/setup-java@v4
+      - name: Set up JDK 17 (actions/setup-java@v5 без cache: 'gradle')
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Установка Node.js 20
+      - name: Set up Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Настройка Android SDK
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Универсальная проверка проекта (Gradle или Веб-проект AI Studio + Capacitor)
+      - name: Авто-обертка веб-проекта AI Studio в Android через Capacitor (если нет папки android и gradlew)
         run: |
-          if [ -d "android" ] || [ -f "build.gradle" ] || [ -f "build.gradle.kts" ] || [ -f "gradlew" ]; then
-            echo "Обнаружен Android/Gradle проект — собираем напрямую через Gradle."
+          if [ -d "android" ] || [ -f "gradlew" ] || [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            echo "Обнаружен Android/Gradle проект — собираем напрямую."
           else
-            echo "Файлы Gradle не найдены (веб-проект из AI Studio). Сборка бандла и обертка через Capacitor..."
+            echo "Папка android и gradlew не найдены (веб-проект из AI Studio). Сборка бандла и инициализация Capacitor..."
             if [ ! -f "package.json" ]; then
               npm init -y
             else
               npm install --legacy-peer-deps || npm install
-              if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1)"; then
-                npm run build
-              fi
             fi
-            WEB_DIR="dist"
+            WEB_DIR="www_bundle"
+            if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1)" 2>/dev/null; then
+              npm run build
+            fi
             if [ -d "dist" ] && [ -f "dist/index.html" ]; then WEB_DIR="dist";
             elif [ -d "build" ] && [ -f "build/index.html" ]; then WEB_DIR="build";
             else
-              mkdir -p dist
-              cp -r index.html *.js *.css assets public dist/ 2>/dev/null || true
+              mkdir -p "\$WEB_DIR"
+              for item in index.html *.html *.js *.css assets public src; do
+                [ -e "\$item" ] && cp -r "\$item" "\$WEB_DIR/" 2>/dev/null || true
+              done
             fi
             npm install @capacitor/core @capacitor/cli @capacitor/android --no-save --legacy-peer-deps
             RAW_NAME=\$(echo "\${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')
             SAFE_PKG=\$(echo "\${RAW_NAME:-app}" | sed 's/^[0-9]/app&/')
-            if [ ! -f "capacitor.config.json" ] && [ ! -f "capacitor.config.ts" ]; then
-              npx cap init "\${{ github.event.repository.name }}" "com.aistudio.\${SAFE_PKG}" --web-dir "\$WEB_DIR"
-            fi
+            cat <<EOF > capacitor.config.json
+          {
+            "appId": "com.aistudio.\${SAFE_PKG}",
+            "appName": "\${{ github.event.repository.name }}",
+            "webDir": "\${WEB_DIR}",
+            "bundledWebRuntime": false
+          }
+          EOF
             npx cap add android
             npx cap sync android
           fi
 
-      - name: 2. Восстановление секретного ключа (.jks) из GitHub Secrets
+      - name: 2. Восстановление или генерация ключа подписи (.jks)
         id: keystore
         env:
           KEYSTORE_BASE64: \${{ secrets.KEYSTORE_BASE64 }}
-        run: |
-          if [ -n "\$KEYSTORE_BASE64" ] && [ "\$KEYSTORE_BASE64" != "-" ]; then
-            echo "\$KEYSTORE_BASE64" | base64 --decode > "\$RUNNER_TEMP/release-key.jks"
-            echo "has_keystore=true" >> \$GITHUB_OUTPUT
-          else
-            echo "has_keystore=false" >> \$GITHUB_OUTPUT
-          fi
-
-      - name: Сборка и подпись APK (Gradle)
-        env:
           KEYSTORE_PASSWORD: \${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: \${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: \${{ secrets.KEY_PASSWORD }}
         run: |
-          if [ -f "./gradlew" ] || [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
-            GRADLE_DIR="."
+          if [ -n "\$KEYSTORE_BASE64" ] && [ "\$KEYSTORE_BASE64" != "-" ] && [ -n "\$KEYSTORE_PASSWORD" ]; then
+            echo "\$KEYSTORE_BASE64" | base64 --decode > "\$RUNNER_TEMP/release-key.jks"
+            echo "store_file=\$RUNNER_TEMP/release-key.jks" >> \$GITHUB_OUTPUT
+            echo "store_password=\$KEYSTORE_PASSWORD" >> \$GITHUB_OUTPUT
+            echo "key_alias=\$KEY_ALIAS" >> \$GITHUB_OUTPUT
+            echo "key_password=\$KEY_PASSWORD" >> \$GITHUB_OUTPUT
           else
-            GRADLE_DIR="android"
-          fi
-          cd "\$GRADLE_DIR"
-          chmod +x ./gradlew
-          if [ "\${{ steps.keystore.outputs.has_keystore }}" = "true" ] && [ -n "\$KEYSTORE_PASSWORD" ]; then
-            ./gradlew assembleRelease \\
-              -Pandroid.injected.signing.store.file="\$RUNNER_TEMP/release-key.jks" \\
-              -Pandroid.injected.signing.store.password="\${KEYSTORE_PASSWORD}" \\
-              -Pandroid.injected.signing.key.alias="\${KEY_ALIAS}" \\
-              -Pandroid.injected.signing.key.password="\${KEY_PASSWORD}" || ./gradlew assembleDebug
-          else
-            ./gradlew assembleDebug || ./gradlew assembleRelease
+            keytool -genkeypair -v -keystore "\$RUNNER_TEMP/release-key.jks" -alias release_key -keyalg RSA -keysize 2048 -validity 10000 -storepass android123 -keypass android123 -dname "CN=AIStudio, OU=Mobile, O=AIStudio, L=City, S=State, C=US"
+            echo "store_file=\$RUNNER_TEMP/release-key.jks" >> \$GITHUB_OUTPUT
+            echo "store_password=android123" >> \$GITHUB_OUTPUT
+            echo "key_alias=release_key" >> \$GITHUB_OUTPUT
+            echo "key_password=android123" >> \$GITHUB_OUTPUT
           fi
 
-      - name: Извлечение информации о коммите и переименование APK
+      - name: Сборка и подпись APK (cd android && ./gradlew assembleRelease)
+        run: |
+          if [ -d "android" ] && [ -f "android/gradlew" ]; then
+            cd android
+          fi
+          chmod +x gradlew
+          ./gradlew assembleRelease \\
+            -Pandroid.injected.signing.store.file="\${{ steps.keystore.outputs.store_file }}" \\
+            -Pandroid.injected.signing.store.password="\${{ steps.keystore.outputs.store_password }}" \\
+            -Pandroid.injected.signing.key.alias="\${{ steps.keystore.outputs.key_alias }}" \\
+            -Pandroid.injected.signing.key.password="\${{ steps.keystore.outputs.key_password }}" || ./gradlew assembleDebug
+
+      - name: Извлечение информации о коммите и переименование APK ({имя_репозитория}_v{github.run_number}.apk)
         id: meta
         run: |
           COMMIT_SHA=\$(git rev-parse HEAD)
@@ -1138,8 +1237,8 @@ jobs:
           COMMIT_AUTHOR=\$(git log -1 --pretty=format:'%an (%ae)')
           COMMIT_MSG=\$(git log -1 --pretty=format:'%s')
           ORIG_APK=\$(find . -path "*/build/outputs/apk/*" -name "*.apk" ! -name "*-unsigned.apk" | head -n 1)
-          # Переименование под формат {имя_репозитория}_v{номер_билда}_{короткий_sha}.apk
-          RENAMED_APK="\${{ github.event.repository.name }}_v\${{ github.run_number }}_\${SHORT_SHA}.apk"
+          # Переименование под формат {имя_репозитория}_v{github.run_number}.apk
+          RENAMED_APK="\${{ github.event.repository.name }}_v\${{ github.run_number }}.apk"
           cp "\${ORIG_APK}" "./\${RENAMED_APK}"
           echo "commit_sha=\${COMMIT_SHA}" >> \$GITHUB_OUTPUT
           echo "short_sha=\${SHORT_SHA}" >> \$GITHUB_OUTPUT
@@ -1151,7 +1250,7 @@ jobs:
       - name: 3A. Отправка APK на эндпоинт бота (Render / Railway / VPS)
         if: \${{ secrets.BOT_WEBHOOK_URL != '' }}
         run: |
-          RENAMED_APK="\${{ github.event.repository.name }}_v\${{ github.run_number }}_\${{ steps.meta.outputs.short_sha }}.apk"
+          RENAMED_APK="\${{ github.event.repository.name }}_v\${{ github.run_number }}.apk"
           curl -sS -X POST "\${{ secrets.BOT_WEBHOOK_URL }}/api/upload-apk" \\
             -H "X-Webhook-Secret: \${{ secrets.WEBHOOK_SECRET }}" \\
             -F "apk_file=@./\${RENAMED_APK}" \\
@@ -1166,7 +1265,7 @@ jobs:
       - name: 3B. Прямая доставка в Telegram через Bot API (sendDocument)
         if: \${{ secrets.BOT_WEBHOOK_URL == '' }}
         run: |
-          RENAMED_APK="\${{ github.event.repository.name }}_v\${{ github.run_number }}_\${{ steps.meta.outputs.short_sha }}.apk"
+          RENAMED_APK="\${{ github.event.repository.name }}_v\${{ github.run_number }}.apk"
           CAPTION="📦 <b>Сборка APK готова!</b>%0A• <b>Проект:</b> <code>\${{ github.event.repository.name }}</code>%0A• <b>Номер сборки:</b> <code>#\${{ github.run_number }}</code> (<code>v\${{ github.run_number }}</code>)%0A• <b>Файл:</b> <code>\${RENAMED_APK}</code>%0A• <b>Ветка:</b> <code>\${{ github.event.client_payload.branch || github.ref_name }}</code>%0A• <b>Автор:</b> \${{ steps.meta.outputs.author }}%0A• <b>Коммит:</b> <code>\${{ steps.meta.outputs.short_sha }}</code> — \${{ steps.meta.outputs.commit_msg }}%0A• <b>Бэкап:</b> <code>\${{ steps.backup.outputs.archive_name }}</code>"
           curl -sS -X POST "https://api.telegram.org/bot\${{ secrets.TELEGRAM_BOT_TOKEN }}/sendDocument" \\
             -F "chat_id=\${{ secrets.TELEGRAM_CHAT_ID }}" \\
@@ -1531,9 +1630,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Настройка рабочей среды Java (JDK 17, без cache: 'gradle')
+      # 2. Настройка рабочей среды Java (JDK 17, actions/setup-java@v5 БЕЗ cache: 'gradle')
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'
@@ -1548,30 +1647,35 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      # 5. Универсальная проверка: Gradle-проект или веб-проект из AI Studio (Capacitor)
-      - name: Detect Project Type & Prepare Web/Capacitor if needed
+      # 5. Автоматическая обертка веб-проекта в Android (если папки android и gradlew еще нет)
+      - name: Prepare Web Project & Wrap with Capacitor
         run: |
-          if [ -d "android" ] || [ -f "build.gradle" ] || [ -f "build.gradle.kts" ] || [ -f "gradlew" ]; then
+          if [ -d "android" ] || [ -f "gradlew" ] || [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
             echo "Обнаружен нативный Android/Gradle проект. Сборка напрямую через Gradle."
           else
-            echo "Файлы Gradle не найдены — это веб-проект из AI Studio. Сборка веб-бандла и обертка в Capacitor..."
+            echo "Папка android и gradlew не найдены — это веб-проект из AI Studio. Сборка веб-бандла и обертка в Capacitor..."
             if [ ! -f "package.json" ]; then
               npm init -y
             else
               npm install --legacy-peer-deps || npm install
-              if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1)"; then
-                npm run build
-              fi
             fi
 
-            WEB_DIR="dist"
+            WEB_DIR="www_bundle"
+            if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1)" 2>/dev/null; then
+              npm run build
+            fi
+
             if [ -d "dist" ] && [ -f "dist/index.html" ]; then
               WEB_DIR="dist"
             elif [ -d "build" ] && [ -f "build/index.html" ]; then
               WEB_DIR="build"
             else
-              mkdir -p dist
-              cp -r index.html *.js *.css assets public dist/ 2>/dev/null || true
+              mkdir -p "\$WEB_DIR"
+              for item in index.html *.html *.js *.css *.json *.png *.svg *.ico assets public src styles; do
+                if [ -e "\$item" ] && [ "\$item" != "package.json" ] && [ "\$item" != "package-lock.json" ]; then
+                  cp -r "\$item" "\$WEB_DIR/" 2>/dev/null || true
+                fi
+              done
             fi
 
             npm install @capacitor/core @capacitor/cli @capacitor/android --no-save --legacy-peer-deps || npm install @capacitor/core @capacitor/cli @capacitor/android --no-save
@@ -1580,52 +1684,61 @@ jobs:
             SAFE_PKG=\$(echo "\${RAW_NAME:-app}" | sed 's/^[0-9]/app&/')
             APP_ID="com.aistudio.\${SAFE_PKG}"
 
-            if [ ! -f "capacitor.config.json" ] && [ ! -f "capacitor.config.ts" ]; then
-              npx cap init "\${{ github.event.repository.name }}" "\$APP_ID" --web-dir "\$WEB_DIR"
-            fi
+            cat <<EOF > capacitor.config.json
+          {
+            "appId": "\${APP_ID}",
+            "appName": "\${{ github.event.repository.name }}",
+            "webDir": "\${WEB_DIR}",
+            "bundledWebRuntime": false
+          }
+          EOF
 
             npx cap add android
             npx cap sync android
           fi
 
-      # 6. Восстановление Keystore (.jks), если секреты заданы
-      - name: Restore Keystore (.jks) if configured
+      # 6. Подготовка Keystore (.jks) для подписи assembleRelease
+      - name: Prepare Signing Keystore (.jks)
         id: keystore
         env:
           KEYSTORE_BASE64: \${{ secrets.KEYSTORE_BASE64 }}
-        run: |
-          if [ -n "\$KEYSTORE_BASE64" ] && [ "\$KEYSTORE_BASE64" != "-" ]; then
-            echo "\$KEYSTORE_BASE64" | base64 --decode > "\$RUNNER_TEMP/release-key.jks"
-            echo "has_keystore=true" >> \$GITHUB_OUTPUT
-          else
-            echo "has_keystore=false" >> \$GITHUB_OUTPUT
-          fi
-
-      # 7. Сборка и подпись APK с помощью Gradle
-      - name: Build & Sign APK with Gradle
-        env:
           KEYSTORE_PASSWORD: \${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: \${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: \${{ secrets.KEY_PASSWORD }}
         run: |
-          if [ -f "./gradlew" ] || [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
-            GRADLE_DIR="."
+          if [ -n "\$KEYSTORE_BASE64" ] && [ "\$KEYSTORE_BASE64" != "-" ] && [ -n "\$KEYSTORE_PASSWORD" ]; then
+            echo "\$KEYSTORE_BASE64" | base64 --decode > "\$RUNNER_TEMP/release-key.jks"
+            echo "store_file=\$RUNNER_TEMP/release-key.jks" >> \$GITHUB_OUTPUT
+            echo "store_password=\$KEYSTORE_PASSWORD" >> \$GITHUB_OUTPUT
+            echo "key_alias=\$KEY_ALIAS" >> \$GITHUB_OUTPUT
+            echo "key_password=\$KEY_PASSWORD" >> \$GITHUB_OUTPUT
           else
-            GRADLE_DIR="android"
-          fi
-          cd "\$GRADLE_DIR"
-          chmod +x ./gradlew
-          if [ "\${{ steps.keystore.outputs.has_keystore }}" = "true" ] && [ -n "\$KEYSTORE_PASSWORD" ]; then
-            ./gradlew assembleRelease \\
-              -Pandroid.injected.signing.store.file="\$RUNNER_TEMP/release-key.jks" \\
-              -Pandroid.injected.signing.store.password="\${KEYSTORE_PASSWORD}" \\
-              -Pandroid.injected.signing.key.alias="\${KEY_ALIAS}" \\
-              -Pandroid.injected.signing.key.password="\${KEY_PASSWORD}" || ./gradlew assembleDebug
-          else
-            ./gradlew assembleDebug || ./gradlew assembleRelease
+            keytool -genkeypair -v \\
+              -keystore "\$RUNNER_TEMP/release-key.jks" \\
+              -alias release_key \\
+              -keyalg RSA -keysize 2048 -validity 10000 \\
+              -storepass android123 -keypass android123 \\
+              -dname "CN=AIStudio, OU=Mobile, O=AIStudio, L=City, S=State, C=US"
+            echo "store_file=\$RUNNER_TEMP/release-key.jks" >> \$GITHUB_OUTPUT
+            echo "store_password=android123" >> \$GITHUB_OUTPUT
+            echo "key_alias=release_key" >> \$GITHUB_OUTPUT
+            echo "key_password=android123" >> \$GITHUB_OUTPUT
           fi
 
-      # 8. Поиск собранного файла APK, сбор метаданных коммита и переименование
+      # 7. Переход в созданную папку android и выполнение chmod +x gradlew && ./gradlew assembleRelease
+      - name: Build Release APK with Gradle
+        run: |
+          if [ -d "android" ] && [ -f "android/gradlew" ]; then
+            cd android
+          fi
+          chmod +x gradlew
+          ./gradlew assembleRelease \\
+            -Pandroid.injected.signing.store.file="\${{ steps.keystore.outputs.store_file }}" \\
+            -Pandroid.injected.signing.store.password="\${{ steps.keystore.outputs.store_password }}" \\
+            -Pandroid.injected.signing.key.alias="\${{ steps.keystore.outputs.key_alias }}" \\
+            -Pandroid.injected.signing.key.password="\${{ steps.keystore.outputs.key_password }}" || ./gradlew assembleDebug
+
+      # 8. Поиск собранного файла APK и переименование в формат {имя_репозитория}_v{github.run_number}.apk
       - name: Locate & Rename compiled APK
         id: locate_apk
         run: |
@@ -1643,8 +1756,8 @@ jobs:
           COMMIT_MSG=\$(git log -1 --pretty=format:'%s')
           AUTHOR=\$(git log -1 --pretty=format:'%an')
           
-          # Автоматическое переименование под формат {имя_репозитория}_v{номер_билда}_{короткий_sha}.apk
-          RENAMED_APK="\${{ github.event.repository.name }}_v\${{ github.run_number }}_\${SHORT_SHA}.apk"
+          # Автоматическое переименование под формат {имя_репозитория}_v{github.run_number}.apk
+          RENAMED_APK="\${{ github.event.repository.name }}_v\${{ github.run_number }}.apk"
           cp "\$APK_FILE" "./\$RENAMED_APK"
           
           echo "apk_path=./\$RENAMED_APK" >> \$GITHUB_OUTPUT
@@ -1653,7 +1766,7 @@ jobs:
           echo "commit_msg=\$COMMIT_MSG" >> \$GITHUB_OUTPUT
           echo "author=\$AUTHOR" >> \$GITHUB_OUTPUT
 
-      # 7. Отправка переименованного APK в Telegram-чат через Telegram Bot API (sendDocument)
+      # 9. Отправка переименованного APK в Telegram-чат через Telegram Bot API (sendDocument)
       - name: Send APK to Telegram
         if: success()
         env:
@@ -1667,7 +1780,7 @@ jobs:
           AUTHOR: \${{ steps.locate_apk.outputs.author }}
           NOTES: \${{ github.event.inputs.notes || 'Сборка через GitHub Actions' }}
         run: |
-          RENAMED_APK="\${REPO_NAME}_v\${RUN_NUM}_\${SHORT_SHA}.apk"
+          RENAMED_APK="\${REPO_NAME}_v\${RUN_NUM}.apk"
           if [ "\$APK_PATH" != "./\$RENAMED_APK" ] && [ -f "\$APK_PATH" ]; then
             cp "\$APK_PATH" "./\$RENAMED_APK"
           fi
@@ -2048,6 +2161,15 @@ jobs:
               </div>
 
               <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={handleUpdateWorkflowInCurrentRepo}
+                  className="px-3.5 py-2 text-xs font-medium bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+                  title="Перезаписать .github/workflows/build-and-deploy.yml в репозитории (setup-java@v5 без cache: gradle + Capacitor)"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  🔄 Обновить workflow в репозитории
+                </button>
                 <button
                   type="button"
                   onClick={handleEnableAutoApkForCurrentRepo}
@@ -2734,6 +2856,13 @@ jobs:
                     {/* Screen 3: Single Repository Automation Card with '⬅️ Назад' */}
                     {simScreen === 'repo_card' && (
                       <div className="space-y-1.5">
+                        <button
+                          type="button"
+                          onClick={handleUpdateWorkflowInCurrentRepo}
+                          className="w-full px-3 py-2 text-xs font-medium bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/30 rounded-lg transition-colors text-center cursor-pointer"
+                        >
+                          🔄 Обновить workflow в репозитории ({currentRepo.repo})
+                        </button>
                         <button
                           type="button"
                           onClick={handleEnableAutoApkForCurrentRepo}
