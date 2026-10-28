@@ -956,26 +956,60 @@ async def set_repo_actions_secret(
         return False, f"HTTP {resp.status}: {err}"
 
 
-async def setup_auto_apk_for_repo(owner: str, repo: str, chat_id: int) -> tuple[bool, str]:
-    """Автоматически записывает TELEGRAM_BOT_TOKEN/BOT_TOKEN и TELEGRAM_CHAT_ID/CHAT_ID в GitHub Secrets и создает build-and-deploy.yml."""
+async def ensure_repo_telegram_secrets(
+    session: aiohttp.ClientSession,
+    owner: str,
+    repo: str,
+    chat_id: int | str = None
+) -> tuple[bool, str]:
+    """Автоматически записывает TELEGRAM_BOT_TOKEN/BOT_TOKEN и TELEGRAM_CHAT_ID/CHAT_ID в GitHub Actions Secrets."""
     if not GITHUB_TOKEN:
         return False, "В .env не задан GITHUB_PAT"
-    target_chat_id = str(chat_id or next(iter(AUTHORIZED_CHAT_IDS)))
+    target_chat_id = str(
+        chat_id
+        or os.getenv("TELEGRAM_CHAT_ID")
+        or os.getenv("CHAT_ID")
+        or next(iter(AUTHORIZED_CHAT_IDS), "-1003962969725")
+    )
     secrets_to_set = {
         "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
         "BOT_TOKEN": TELEGRAM_BOT_TOKEN,
         "TELEGRAM_CHAT_ID": target_chat_id,
         "CHAT_ID": target_chat_id,
     }
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "Telegram-APK-Build-Bot/2.0"
+    }
+    pk_url = f"https://api.github.com/repos/{owner}/{repo}/actions/secrets/public-key"
+    async with session.get(pk_url, headers=headers) as pk_resp:
+        if pk_resp.status != 200:
+            return False, f"Ошибка получения public-key (HTTP {pk_resp.status})"
+        cached_pk = await pk_resp.json()
+
+    for s_name, s_val in secrets_to_set.items():
+        if not s_val:
+            continue
+        ok, msg = await set_repo_actions_secret(
+            session, owner, repo, GITHUB_TOKEN, s_name, s_val, cached_pk=cached_pk
+        )
+        if not ok:
+            return False, msg
+    return True, f"Секреты {', '.join(secrets_to_set.keys())} записаны (chat_id={target_chat_id})"
+
+
+async def setup_auto_apk_for_repo(owner: str, repo: str, chat_id: int) -> tuple[bool, str]:
+    """Настраивает новый репозиторий: прописывает секреты через PyNaCl в GitHub Actions Secrets и создает workflow."""
     async with aiohttp.ClientSession() as session:
-        for s_name, s_val in secrets_to_set.items():
-            ok, msg = await set_repo_actions_secret(session, owner, repo, GITHUB_TOKEN, s_name, s_val)
-            if not ok:
-                return False, msg
-    return True, f"Секреты {', '.join(secrets_to_set.keys())} записаны для chat_id={target_chat_id}"
+        ok, msg = await ensure_repo_telegram_secrets(session, owner, repo, chat_id=chat_id)
+        if not ok:
+            return False, msg
+    return True, msg
 
 
-async def trigger_github_workflow(branch: str, notes: str, initiated_by: str) -> tuple[bool, str]:
+async def trigger_github_workflow(branch: str, notes: str, initiated_by: str, chat_id: int = None) -> tuple[bool, str]:
     if not GITHUB_TOKEN:
         return False, "В .env не задан GITHUB_PAT"
 
@@ -986,11 +1020,13 @@ async def trigger_github_workflow(branch: str, notes: str, initiated_by: str) ->
         "User-Agent": "Telegram-APK-Build-Bot/1.0"
     }
 
-    # 1. Запуск workflow_dispatch для build-apk.yml / build-and-deploy.yml
+    # 1. Перед запуском сборки гарантированно записываем секреты TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID
     url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows/{GITHUB_WORKFLOW}/dispatches"
     payload = {"ref": branch, "inputs": {"notes": f"{notes} ({initiated_by})"}}
 
     async with aiohttp.ClientSession() as session:
+        await ensure_repo_telegram_secrets(session, GITHUB_OWNER, GITHUB_REPO, chat_id=chat_id)
+
         async with session.post(url, json=payload, headers=headers) as resp:
             if resp.status == 204:
                 return True, f"Workflow {GITHUB_WORKFLOW} запущен в {GITHUB_OWNER}/{GITHUB_REPO} (HTTP 204)"
@@ -1041,7 +1077,12 @@ async def cmd_build(message: Message, command: CommandObject):
         f"<code>{GITHUB_OWNER}/{GITHUB_REPO}</code> (ветка: <code>{branch}</code>)..."
     )
 
-    ok, info = await trigger_github_workflow(branch=branch, notes=notes, initiated_by=author)
+    ok, info = await trigger_github_workflow(
+        branch=branch,
+        notes=notes,
+        initiated_by=author,
+        chat_id=message.chat.id
+    )
     if ok:
         append_to_dev_log(f"Сборка APK запущена из Telegram ({author}), ветка '{branch}': {notes}")
         kb = InlineKeyboardMarkup(inline_keyboard=[[

@@ -449,7 +449,7 @@ def encrypt_github_secret(public_key_b64: str, secret_value: str) -> str:
     """Шифрует значение секрета публичным ключом репозитория (LibSodium / PyNaCl)."""
     pk = public.PublicKey(public_key_b64.encode("utf-8"), encoding.Base64Encoder())
     sealed_box = public.SealedBox(pk)
-    encrypted = sealed_box.encrypt(secret_value.encode("utf-8"))
+    encrypted = sealed_box.encrypt(str(secret_value).encode("utf-8"))
     return base64.b64encode(encrypted).decode("utf-8")
 
 
@@ -462,7 +462,7 @@ async def set_repo_actions_secret(
     secret_value: str,
     cached_pk: dict = None
 ) -> tuple[bool, str]:
-    """Записывает секрет в GitHub Actions Secrets (/repos/{owner}/{repo}/actions/secrets/{secret_name})."""
+    """Записывает секрет в GitHub Actions Secrets (PUT /repos/{owner}/{repo}/actions/secrets/{secret_name})."""
     if not HAS_NACL:
         return False, "Библиотека PyNaCl не установлена (нужна для шифрования GitHub Secrets)."
 
@@ -493,15 +493,111 @@ async def set_repo_actions_secret(
         return False, f"Ошибка записи секрета {secret_name} (HTTP {resp.status}): {err}"
 
 
+def resolve_target_chat_id(chat_id: int | str = None) -> str:
+    """Возвращает гарантированно непустой CHAT_ID для записи в GitHub Actions Secrets."""
+    cfg = load_bot_config()
+    configured_chat_id = str(cfg.get("telegram_chat_id") or "").strip()
+    if chat_id and str(chat_id).strip():
+        target = str(chat_id).strip()
+        if not configured_chat_id or configured_chat_id == "-1003962969725":
+            save_bot_config({"telegram_chat_id": target})
+        if target.lstrip("-").isdigit():
+            AUTHORIZED_CHAT_IDS.add(int(target))
+        return target
+    if configured_chat_id:
+        return configured_chat_id
+    if AUTHORIZED_CHAT_IDS:
+        return str(next(iter(AUTHORIZED_CHAT_IDS)))
+    return "-1003962969725"
+
+
+async def ensure_repo_telegram_secrets(
+    session: aiohttp.ClientSession,
+    owner: str,
+    repo: str,
+    token: str,
+    chat_id: int | str = None
+) -> tuple[bool, str, str]:
+    """
+    Гарантированно записывает секреты TELEGRAM_BOT_TOKEN, BOT_TOKEN, TELEGRAM_CHAT_ID и CHAT_ID
+    в настройки репозитория на GitHub (PUT /repos/{owner}/{repo}/actions/secrets/{secret_name})
+    с шифрованием через PyNaCl и публичный ключ репозитория.
+    Возвращает (успех, описание, использованный_chat_id).
+    """
+    cfg = load_bot_config()
+    target_chat_id = resolve_target_chat_id(chat_id)
+    bot_token_val = (TELEGRAM_BOT_TOKEN or os.getenv("BOT_TOKEN") or "").strip()
+
+    secrets_to_set = {
+        "TELEGRAM_BOT_TOKEN": bot_token_val,
+        "BOT_TOKEN": bot_token_val,
+        "TELEGRAM_CHAT_ID": target_chat_id,
+        "CHAT_ID": target_chat_id,
+    }
+
+    # Дополнительно передаем секреты подписи APK, если они заданы
+    for cfg_key, secret_env_name in [
+        ("keystore_base64", "KEYSTORE_BASE64"),
+        ("keystore_password", "KEYSTORE_PASSWORD"),
+        ("key_alias", "KEY_ALIAS"),
+        ("key_password", "KEY_PASSWORD"),
+    ]:
+        val = cfg.get(cfg_key, "")
+        if val and val != "-":
+            secrets_to_set[secret_env_name] = val
+
+    headers = get_github_headers(token)
+    pk_url = f"https://api.github.com/repos/{owner}/{repo}/actions/secrets/public-key"
+    async with session.get(pk_url, headers=headers) as pk_resp:
+        if pk_resp.status != 200:
+            err = await pk_resp.text()
+            return (
+                False,
+                f"Не удалось получить публичный ключ секретов {owner}/{repo} (HTTP {pk_resp.status}): {err}",
+                target_chat_id
+            )
+        cached_pk = await pk_resp.json()
+
+    written_names = []
+    for s_name, s_val in secrets_to_set.items():
+        if not s_val:
+            continue
+        ok, msg = await set_repo_actions_secret(
+            session, owner, repo, token, s_name, s_val, cached_pk=cached_pk
+        )
+        if not ok:
+            return False, msg, target_chat_id
+        written_names.append(s_name)
+
+    return (
+        True,
+        f"Секретов записано: {len(written_names)} ({', '.join(written_names)}; chat_id={target_chat_id})",
+        target_chat_id
+    )
+
+
 async def create_or_update_workflow_file(
     session: aiohttp.ClientSession,
     owner: str,
     repo: str,
     token: str,
     branch: str = "main",
-    default_chat_id: str = ""
+    default_chat_id: str = "",
+    ensure_secrets: bool = True
 ) -> tuple[bool, str]:
-    """Создает или обновляет .github/workflows/build-and-deploy.yml в репозитории."""
+    """
+    Создает или обновляет .github/workflows/build-and-deploy.yml в репозитории.
+    Перед записью файла воркфлоу автоматически прописывает секреты TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID,
+    так как создание файла воркфлоу сразу запускает push-сборку в GitHub Actions.
+    """
+    resolved_chat_id = resolve_target_chat_id(default_chat_id)
+    if ensure_secrets:
+        sec_ok, sec_msg, resolved_chat_id = await ensure_repo_telegram_secrets(
+            session, owner, repo, token, chat_id=resolved_chat_id
+        )
+        if not sec_ok:
+            logger.warning(f"Предупреждение при записи секретов перед созданием workflow в {owner}/{repo}: {sec_msg}")
+
     headers = get_github_headers(token)
     path = ".github/workflows/build-and-deploy.yml"
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
@@ -513,7 +609,7 @@ async def create_or_update_workflow_file(
             data = await resp.json()
             existing_sha = data.get("sha")
 
-    yaml_content = generate_workflow_yaml(default_chat_id=default_chat_id)
+    yaml_content = generate_workflow_yaml(default_chat_id=resolved_chat_id)
     content_b64 = base64.b64encode(yaml_content.encode("utf-8")).decode("utf-8")
 
     payload = {
@@ -533,7 +629,8 @@ async def create_or_update_workflow_file(
 async def setup_auto_apk_for_repo(owner: str, repo: str, chat_id: int) -> tuple[bool, str]:
     """
     Полный цикл настройки автосборки APK в новом репозитории:
-    1. Автоматически создает GitHub Actions Secrets через /repos/{owner}/{repo}/actions/secrets/{secret_name}:
+    1. Автоматически создает GitHub Actions Secrets через PUT /repos/{owner}/{repo}/actions/secrets/{secret_name}
+       с шифрованием через PyNaCl:
        - TELEGRAM_BOT_TOKEN и BOT_TOKEN
        - TELEGRAM_CHAT_ID и CHAT_ID
        - (опционально) KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD
@@ -544,67 +641,31 @@ async def setup_auto_apk_for_repo(owner: str, repo: str, chat_id: int) -> tuple[
     if not token:
         return False, "MISSING_GITHUB_PAT"
 
-    # Используем текущий chat_id (из которого нажата кнопка в боте), либо явно заданный пользователем telegram_chat_id
-    configured_chat_id = str(cfg.get("telegram_chat_id") or "").strip()
-    if chat_id and (not configured_chat_id or configured_chat_id == "-1003962969725"):
-        target_chat_id = str(chat_id)
-        save_bot_config({"telegram_chat_id": target_chat_id})
-    else:
-        target_chat_id = configured_chat_id or str(chat_id)
-
-    if chat_id:
-        AUTHORIZED_CHAT_IDS.add(int(chat_id))
-
-    bot_token_val = (TELEGRAM_BOT_TOKEN or os.getenv("BOT_TOKEN") or "").strip()
-    secrets_to_set = {
-        "TELEGRAM_BOT_TOKEN": bot_token_val,
-        "BOT_TOKEN": bot_token_val,
-        "TELEGRAM_CHAT_ID": target_chat_id,
-        "CHAT_ID": target_chat_id,
-    }
-
-    # Если у нас сохранены данные подписи APK (keystore), прописываем и их
-    for cfg_key, secret_env_name in [
-        ("keystore_base64", "KEYSTORE_BASE64"),
-        ("keystore_password", "KEYSTORE_PASSWORD"),
-        ("key_alias", "KEY_ALIAS"),
-        ("key_password", "KEY_PASSWORD"),
-    ]:
-        val = cfg.get(cfg_key, "")
-        if val and val != "-":
-            secrets_to_set[secret_env_name] = val
-
-    headers = get_github_headers(token)
     async with aiohttp.ClientSession() as session:
-        # Получаем public-key репозитория один раз для шифрования всех секретов
-        pk_url = f"https://api.github.com/repos/{owner}/{repo}/actions/secrets/public-key"
-        cached_pk = None
-        async with session.get(pk_url, headers=headers) as pk_resp:
-            if pk_resp.status == 200:
-                cached_pk = await pk_resp.json()
-
-        # 1. Прописываем секреты в Actions Secrets (/repos/{owner}/{repo}/actions/secrets/{secret_name})
-        for s_name, s_val in secrets_to_set.items():
-            if not s_val:
-                continue
-            ok, msg = await set_repo_actions_secret(
-                session, owner, repo, token, s_name, s_val, cached_pk=cached_pk
-            )
-            if not ok:
-                return False, msg
-
-        # 2. Создаем .github/workflows/build-and-deploy.yml
-        ok, msg = await create_or_update_workflow_file(
-            session, owner, repo, token, default_chat_id=target_chat_id
+        # 1. Сначала прописываем секреты в Actions Secrets (до коммита workflow-файла!)
+        sec_ok, sec_summary, target_chat_id = await ensure_repo_telegram_secrets(
+            session, owner, repo, token, chat_id=chat_id
         )
-        if not ok:
-            return False, msg
+        if not sec_ok:
+            return False, sec_summary
+
+        # 2. Создаем или обновляем .github/workflows/build-and-deploy.yml
+        wf_ok, wf_msg = await create_or_update_workflow_file(
+            session,
+            owner,
+            repo,
+            token,
+            default_chat_id=target_chat_id,
+            ensure_secrets=False
+        )
+        if not wf_ok:
+            return False, wf_msg
 
     append_to_dev_log(
         f"В репозитории `{owner}/{repo}` автоматически настроен CI/CD "
-        f"(.github/workflows/build-and-deploy.yml + GitHub Secrets: {', '.join(secrets_to_set.keys())}, chat_id={target_chat_id})."
+        f"(.github/workflows/build-and-deploy.yml + {sec_summary})."
     )
-    return True, f"Секретов записано: {len(secrets_to_set)} ({', '.join(secrets_to_set.keys())}; chat_id={target_chat_id})"
+    return True, sec_summary
 
 
 async def enable_github_pages_for_repo(owner: str, repo: str) -> tuple[bool, str]:
@@ -655,11 +716,13 @@ async def trigger_github_workflow(
     branch: str = None,
     notes: str = "Запуск сборки из Telegram",
     initiated_by: str = "Telegram",
-    repo_override: str = None
+    repo_override: str = None,
+    chat_id: int = None
 ) -> tuple[bool, str]:
     """
-    Запускает сборку APK в выбранном или основном репозитории через workflow_dispatch
-    (пробует основной воркфлоу, затем build-and-deploy.yml / build-apk.yml, затем repository_dispatch).
+    Перед запуском сборки автоматически проверяет и записывает секреты
+    TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID в репозиторий через GitHub Actions Secrets API,
+    затем запускает сборку APK через workflow_dispatch / repository_dispatch.
     """
     cfg = load_bot_config()
     token = cfg.get("github_pat", "")
@@ -688,6 +751,13 @@ async def trigger_github_workflow(
 
     last_err = ""
     async with aiohttp.ClientSession() as session:
+        # Автоматически прописываем репозиторные секреты перед запуском сборки
+        sec_ok, sec_msg, _ = await ensure_repo_telegram_secrets(
+            session, owner, repo, token, chat_id=chat_id
+        )
+        if not sec_ok:
+            logger.warning(f"Не удалось обновить секреты перед сборкой в {owner}/{repo}: {sec_msg}")
+
         for wf_name in workflows_to_try:
             workflow_url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{wf_name}/dispatches"
             async with session.post(workflow_url, json=payload, headers=headers) as resp:
@@ -1006,36 +1076,48 @@ async def check_for_new_repositories(manual_trigger_chat_id: int = None) -> None
     known_names.update(new_names)
     save_known_repos(known_names)
 
-    # Отправляем карточку по каждому новому репозиторию
-    for r in repos_data:
-        r_name = r.get("name")
-        if r_name not in new_names:
-            continue
+    # Отправляем карточку по каждому новому репозиторию и сразу записываем секреты в GitHub Actions Secrets
+    async with aiohttp.ClientSession() as session:
+        for r in repos_data:
+            r_name = r.get("name")
+            if r_name not in new_names:
+                continue
 
-        desc = r.get("description") or "Без описания"
-        lang = r.get("language") or "Не определен"
-        html_url = r.get("html_url") or f"https://github.com/{owner}/{r_name}"
+            desc = r.get("description") or "Без описания"
+            lang = r.get("language") or "Не определен"
+            html_url = r.get("html_url") or f"https://github.com/{owner}/{r_name}"
 
-        card_text = (
-            f"🆕 <b>Обнаружен новый репозиторий на GitHub!</b>\n\n"
-            f"• <b>Проект:</b> <a href=\"{html_url}\">{owner}/{r_name}</a>\n"
-            f"• <b>Описание:</b> {desc}\n"
-            f"• <b>Язык:</b> <code>{lang}</code>\n"
-            f"• <b>Ветка по умолчанию:</b> <code>{r.get('default_branch', 'main')}</code>\n\n"
-            f"Выберите действие для настройки в 1 клик:"
-        )
-        kb = get_new_repo_card_keyboard(r_name, is_new_notification=True)
-
-        for chat_id in AUTHORIZED_CHAT_IDS:
-            try:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=card_text,
-                    reply_markup=kb,
-                    disable_web_page_preview=True
+            secrets_status_line = "⏳ Будут созданы при подключении автосборки"
+            if token:
+                sec_ok, sec_msg, used_chat_id = await ensure_repo_telegram_secrets(
+                    session, owner, r_name, token, chat_id=manual_trigger_chat_id
                 )
-            except Exception as exc:
-                logger.error(f"Ошибка отправки карточки нового репозитория в чат {chat_id}: {exc}")
+                if sec_ok:
+                    secrets_status_line = f"✅ Записаны автоматически (<code>TELEGRAM_BOT_TOKEN</code>, <code>TELEGRAM_CHAT_ID={used_chat_id}</code>)"
+                else:
+                    secrets_status_line = f"⚠️ {sec_msg}"
+
+            card_text = (
+                f"🆕 <b>Обнаружен новый репозиторий на GitHub!</b>\n\n"
+                f"• <b>Проект:</b> <a href=\"{html_url}\">{owner}/{r_name}</a>\n"
+                f"• <b>Описание:</b> {desc}\n"
+                f"• <b>Язык:</b> <code>{lang}</code>\n"
+                f"• <b>Ветка по умолчанию:</b> <code>{r.get('default_branch', 'main')}</code>\n"
+                f"• <b>GitHub Secrets:</b> {secrets_status_line}\n\n"
+                f"Выберите действие для настройки в 1 клик:"
+            )
+            kb = get_new_repo_card_keyboard(r_name, is_new_notification=True)
+
+            for chat_id in AUTHORIZED_CHAT_IDS:
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=card_text,
+                        reply_markup=kb,
+                        disable_web_page_preview=True
+                    )
+                except Exception as exc:
+                    logger.error(f"Ошибка отправки карточки нового репозитория в чат {chat_id}: {exc}")
 
 
 async def background_repo_watcher():
@@ -1228,7 +1310,8 @@ async def perform_build(
         branch=branch,
         notes=notes,
         initiated_by=sender_label,
-        repo_override=repo
+        repo_override=repo,
+        chat_id=chat_id
     )
 
     if success:
