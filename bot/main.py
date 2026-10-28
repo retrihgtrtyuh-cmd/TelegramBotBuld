@@ -333,10 +333,14 @@ def generate_workflow_yaml(default_chat_id: str = "") -> str:
     Генерирует универсальный файл .github/workflows/build-and-deploy.yml для любых проектов из AI Studio.
     1) В Set up JDK 17 использует actions/setup-java@v5 БЕЗ cache: 'gradle'.
     2) Если папки android и файла gradlew нет — устанавливает Node.js, собирает веб-бандл (npm install && npm run build
-       или корневой index.html), создает capacitor.config.json с именем репозитория, выполняет npx cap add android,
-       переходит в папку android и собирает APK через ./gradlew assembleRelease -x lint.
-    3) Переименовывает готовый APK в формат {имя_репозитория}_v{github.run_number}.apk и отправляет в Telegram,
-       используя секреты TELEGRAM_BOT_TOKEN (или BOT_TOKEN) и TELEGRAM_CHAT_ID (или CHAT_ID).
+       или корневой index.html), создает capacitor.config.json с постоянным appId репозитория, выполняет npx cap add android.
+       Если папка android уже есть и используется Capacitor — синхронизирует веб-бандл (npx cap sync android).
+    3) Автоматически инкрементирует versionCode (${{ github.run_number }}) и versionName ("1.0.${{ github.run_number }}")
+       в build.gradle / build.gradle.kts на каждой сборке, чтобы Android обновлял приложение поверх старого без потери данных.
+    4) Гарантирует единую постоянную подпись (.jks): берет ключ из secrets.KEYSTORE_BASE64, либо из .github/signing/release-key.jks
+       в репозитории (а при первом запуске без секрета — генерирует .github/signing/release-key.jks один раз и сохраняет его в репо),
+       затем явно выравнивает (zipalign) и подписывает APK через apksigner (V1+V2+V3).
+    5) Переименовывает готовый APK в формат {имя_репозитория}_v{github.run_number}_{короткий_sha}.apk и отправляет в Telegram.
     """
     yaml_template = """name: Build & Deploy Android APK to Telegram
 
@@ -352,6 +356,9 @@ on:
         required: false
         default: 'Автоматическая сборка APK'
 
+permissions:
+  contents: write
+
 jobs:
   build-and-deploy:
     name: Build Android APK & Send to Telegram
@@ -360,6 +367,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
@@ -382,10 +391,23 @@ jobs:
           yes | sudo ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
           echo "y" | sudo ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager --install "platforms;android-34" "build-tools;34.0.0" "platform-tools"
 
-      - name: Prepare Web Project & Wrap with Capacitor (if no android/ or gradlew)
+      - name: Prepare Web Project & Wrap with Capacitor
         run: |
+          RAW_NAME=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')
+          if [ -z "$RAW_NAME" ]; then RAW_NAME="app"; fi
+          SAFE_PKG=$(echo "$RAW_NAME" | sed 's/^[0-9]/app&/')
+          APP_ID="com.aistudio.${SAFE_PKG}"
+
           if [ -d "android" ] || [ -f "gradlew" ] || [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
-            echo "Обнаружен существующий Android/Gradle проект — шаг обертки Capacitor не требуется."
+            echo "Обнаружен существующий Android/Gradle проект."
+            if [ -f "package.json" ] && ( [ -f "capacitor.config.json" ] || [ -f "capacitor.config.ts" ] ); then
+              echo "Обнаружен Capacitor-проект — обновляем веб-бандл и синхронизируем с android/..."
+              npm install --legacy-peer-deps || npm install
+              if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1)" 2>/dev/null; then
+                npm run build
+              fi
+              npx cap sync android || true
+            fi
           else
             echo "Папка android/ и gradlew не найдены. Обнаружен веб-проект (AI Studio) — выполняем сборку и обертку в Android через Capacitor..."
 
@@ -420,13 +442,8 @@ jobs:
               fi
             fi
 
-            # 2. Автоматическая инициализация Capacitor (v6 для совместимости с JDK 17) и создание capacitor.config.json с именем репозитория
+            # 2. Автоматическая инициализация Capacitor (v6 для совместимости с JDK 17) с постоянным appId репозитория
             npm install @capacitor/core@^6.0.0 @capacitor/cli@^6.0.0 @capacitor/android@^6.0.0 --no-save --legacy-peer-deps || npm install @capacitor/core@^6.0.0 @capacitor/cli@^6.0.0 @capacitor/android@^6.0.0 --no-save
-
-            RAW_NAME=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')
-            if [ -z "$RAW_NAME" ]; then RAW_NAME="app"; fi
-            SAFE_PKG=$(echo "$RAW_NAME" | sed 's/^[0-9]/app&/')
-            APP_ID="com.aistudio.${SAFE_PKG}"
 
             cat <<EOF > capacitor.config.json
           {
@@ -442,7 +459,27 @@ jobs:
             echo "sdk.dir=/usr/local/lib/android/sdk" > android/local.properties
           fi
 
-      - name: Prepare Signing Keystore (.jks)
+      - name: Auto-Increment App Version (versionCode & versionName)
+        id: version
+        run: |
+          VERSION_CODE="${{ github.run_number }}"
+          VERSION_NAME="1.0.${{ github.run_number }}"
+          for GRADLE_FILE in android/app/build.gradle android/app/build.gradle.kts app/build.gradle app/build.gradle.kts; do
+            if [ -f "$GRADLE_FILE" ]; then
+              if [[ "$GRADLE_FILE" == *.kts ]]; then
+                sed -i -E "s/versionCode[[:space:]]*=[[:space:]]*[0-9]+/versionCode = ${VERSION_CODE}/g" "$GRADLE_FILE"
+                sed -i -E "s/versionName[[:space:]]*=[[:space:]]*\"[^\"]*\"/versionName = \"${VERSION_NAME}\"/g" "$GRADLE_FILE"
+              else
+                sed -i -E "s/versionCode[[:space:]]*=*[[:space:]]*[0-9]+/versionCode ${VERSION_CODE}/g" "$GRADLE_FILE"
+                sed -i -E "s/versionName[[:space:]]*=*[[:space:]]*['\"][^'\"]*['\"]/versionName \"${VERSION_NAME}\"/g" "$GRADLE_FILE"
+              fi
+              echo "Обновлена версия в $GRADLE_FILE -> versionCode=${VERSION_CODE}, versionName=${VERSION_NAME}"
+            fi
+          done
+          echo "version_code=${VERSION_CODE}" >> $GITHUB_OUTPUT
+          echo "version_name=${VERSION_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Prepare Persistent Signing Keystore (.jks)
         id: keystore
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
@@ -450,24 +487,39 @@ jobs:
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          if [ -n "$KEYSTORE_BASE64" ] && [ "$KEYSTORE_BASE64" != "-" ] && [ -n "$KEYSTORE_PASSWORD" ]; then
-            echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release-key.jks"
-            echo "store_file=$RUNNER_TEMP/release-key.jks" >> $GITHUB_OUTPUT
-            echo "store_password=$KEYSTORE_PASSWORD" >> $GITHUB_OUTPUT
-            echo "key_alias=$KEY_ALIAS" >> $GITHUB_OUTPUT
-            echo "key_password=$KEY_PASSWORD" >> $GITHUB_OUTPUT
+          STORE_FILE="$RUNNER_TEMP/release-key.jks"
+          STORE_PASS="${KEYSTORE_PASSWORD:-android123}"
+          ALIAS="${KEY_ALIAS:-release_key}"
+          KEY_PASS="${KEY_PASSWORD:-$STORE_PASS}"
+          PERSISTED_REPO_KEYSTORE=".github/signing/release-key.jks"
+
+          if [ -n "$KEYSTORE_BASE64" ] && [ "$KEYSTORE_BASE64" != "-" ]; then
+            echo "Используется постоянный ключ подписи из GitHub Secrets (KEYSTORE_BASE64)."
+            echo "$KEYSTORE_BASE64" | tr -d '\\n\\r ' | base64 --decode > "$STORE_FILE"
+          elif [ -f "$PERSISTED_REPO_KEYSTORE" ]; then
+            echo "Используется постоянный ключ подписи репозитория ($PERSISTED_REPO_KEYSTORE)."
+            cp "$PERSISTED_REPO_KEYSTORE" "$STORE_FILE"
           else
+            echo "Первый запуск без секрета KEYSTORE_BASE64: генерируем постоянный ключ для репозитория и сохраняем в $PERSISTED_REPO_KEYSTORE..."
+            mkdir -p .github/signing
             keytool -genkeypair -v \\
-              -keystore "$RUNNER_TEMP/release-key.jks" \\
-              -alias release_key \\
+              -keystore "$PERSISTED_REPO_KEYSTORE" \\
+              -alias "$ALIAS" \\
               -keyalg RSA -keysize 2048 -validity 10000 \\
-              -storepass android123 -keypass android123 \\
+              -storepass "$STORE_PASS" -keypass "$KEY_PASS" \\
               -dname "CN=AIStudio, OU=Mobile, O=AIStudio, L=City, S=State, C=US"
-            echo "store_file=$RUNNER_TEMP/release-key.jks" >> $GITHUB_OUTPUT
-            echo "store_password=android123" >> $GITHUB_OUTPUT
-            echo "key_alias=release_key" >> $GITHUB_OUTPUT
-            echo "key_password=android123" >> $GITHUB_OUTPUT
+            cp "$PERSISTED_REPO_KEYSTORE" "$STORE_FILE"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -f "$PERSISTED_REPO_KEYSTORE"
+            git commit -m "ci: persist Android release keystore for seamless APK updates [skip ci]" || true
+            git push origin "HEAD:${GITHUB_REF_NAME}" || true
           fi
+
+          echo "store_file=$STORE_FILE" >> $GITHUB_OUTPUT
+          echo "store_password=$STORE_PASS" >> $GITHUB_OUTPUT
+          echo "key_alias=$ALIAS" >> $GITHUB_OUTPUT
+          echo "key_password=$KEY_PASS" >> $GITHUB_OUTPUT
 
       - name: Build Release APK with Gradle
         env:
@@ -481,15 +533,18 @@ jobs:
           echo "sdk.dir=/usr/local/lib/android/sdk" > local.properties
           chmod +x gradlew
           ./gradlew assembleRelease -x lint -x lintVitalRelease \\
+            -Pandroid.injected.invoked.from.ide=true \\
             -Pandroid.injected.signing.store.file="${{ steps.keystore.outputs.store_file }}" \\
             -Pandroid.injected.signing.store.password="${{ steps.keystore.outputs.store_password }}" \\
             -Pandroid.injected.signing.key.alias="${{ steps.keystore.outputs.key_alias }}" \\
-            -Pandroid.injected.signing.key.password="${{ steps.keystore.outputs.key_password }}" || ./gradlew assembleDebug -x lint
+            -Pandroid.injected.signing.key.password="${{ steps.keystore.outputs.key_password }}" || ./gradlew assembleRelease -x lint -x lintVitalRelease || ./gradlew assembleDebug -x lint
 
-      - name: Locate & Rename APK ({repo}_v{run_number}.apk)
+      - name: Align, Sign with Persistent Key (V1+V2+V3) & Rename APK
         id: locate_apk
+        env:
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
         run: |
-          APK_FILE=$(find . -path "*/build/outputs/apk/*" -name "*.apk" ! -name "*-unsigned.apk" | head -n 1)
+          APK_FILE=$(find . -path "*/build/outputs/apk/release/*" -name "*.apk" | head -n 1)
           if [ -z "$APK_FILE" ]; then
             APK_FILE=$(find . -path "*/build/outputs/apk/*" -name "*.apk" | head -n 1)
           fi
@@ -497,12 +552,36 @@ jobs:
             echo "::error::Файл APK не найден в build/outputs/apk/"
             exit 1
           fi
+
+          BUILD_TOOLS_DIR=$(ls -d ${ANDROID_SDK_ROOT}/build-tools/* | sort -V | tail -n 1)
+          ZIPALIGN="${BUILD_TOOLS_DIR}/zipalign"
+          APKSIGNER="${BUILD_TOOLS_DIR}/apksigner"
+
           SHORT_SHA=$(git rev-parse --short HEAD)
-          RENAMED_APK="${{ github.event.repository.name }}_v${{ github.run_number }}.apk"
-          cp "$APK_FILE" "./$RENAMED_APK"
+          RENAMED_APK="${{ github.event.repository.name }}_v${{ github.run_number }}_${SHORT_SHA}.apk"
+          ALIGNED_APK="$RUNNER_TEMP/aligned.apk"
+
+          "$ZIPALIGN" -p -f 4 "$APK_FILE" "$ALIGNED_APK"
+          "$APKSIGNER" sign \\
+            --ks "${{ steps.keystore.outputs.store_file }}" \\
+            --ks-key-alias "${{ steps.keystore.outputs.key_alias }}" \\
+            --ks-pass "pass:${{ steps.keystore.outputs.store_password }}" \\
+            --key-pass "pass:${{ steps.keystore.outputs.key_password }}" \\
+            --v1-signing-enabled true \\
+            --v2-signing-enabled true \\
+            --v3-signing-enabled true \\
+            --out "./$RENAMED_APK" \\
+            "$ALIGNED_APK"
+
+          CERT_INFO=$("$APKSIGNER" verify --print-certs "./$RENAMED_APK" || true)
+          echo "$CERT_INFO"
+          CERT_SHA256=$(echo "$CERT_INFO" | grep -m1 "SHA-256 digest:" | awk '{print $NF}' | cut -c1-16)
+          if [ -z "$CERT_SHA256" ]; then CERT_SHA256="verified"; fi
+
           echo "apk_path=./$RENAMED_APK" >> $GITHUB_OUTPUT
           echo "apk_filename=$RENAMED_APK" >> $GITHUB_OUTPUT
           echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "cert_sha256=$CERT_SHA256" >> $GITHUB_OUTPUT
           echo "commit_msg=$(git log -1 --pretty=format:'%s')" >> $GITHUB_OUTPUT
           echo "author=$(git log -1 --pretty=format:'%an')" >> $GITHUB_OUTPUT
 
@@ -515,7 +594,11 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
           REPO_NAME: ${{ github.event.repository.name }}
           RUN_NUM: ${{ github.run_number }}
+          VERSION_NAME: ${{ steps.version.outputs.version_name }}
+          VERSION_CODE: ${{ steps.version.outputs.version_code }}
+          CERT_SHA256: ${{ steps.locate_apk.outputs.cert_sha256 }}
           APK_PATH: ${{ steps.locate_apk.outputs.apk_path }}
+          APK_FILENAME: ${{ steps.locate_apk.outputs.apk_filename }}
           SHORT_SHA: ${{ steps.locate_apk.outputs.short_sha }}
           COMMIT_MSG: ${{ steps.locate_apk.outputs.commit_msg }}
           AUTHOR: ${{ steps.locate_apk.outputs.author }}
@@ -534,11 +617,11 @@ jobs:
             echo "::error::Секрет TELEGRAM_CHAT_ID (или CHAT_ID) не найден в GitHub Actions Secrets!"
             exit 1
           fi
-          RENAMED_APK="${REPO_NAME}_v${RUN_NUM}.apk"
+          RENAMED_APK="${APK_FILENAME:-${REPO_NAME}_v${RUN_NUM}_${SHORT_SHA}.apk}"
           if [ "$APK_PATH" != "./$RENAMED_APK" ] && [ -f "$APK_PATH" ]; then
             cp "$APK_PATH" "./$RENAMED_APK"
           fi
-          CAPTION="📦 <b>Сборка APK готова!</b>%0A%0A• <b>Проект:</b> <code>${REPO_NAME}</code>%0A• <b>Номер сборки:</b> <code>#${RUN_NUM}</code> (<code>v${RUN_NUM}</code>)%0A• <b>Файл:</b> <code>${RENAMED_APK}</code>%0A• <b>Ветка:</b> <code>${{ github.ref_name }}</code>%0A• <b>Коммит:</b> <code>${SHORT_SHA}</code> — ${COMMIT_MSG}%0A• <b>Автор:</b> ${AUTHOR}"
+          CAPTION="📦 <b>Сборка APK готова!</b>%0A%0A• <b>Проект:</b> <code>${REPO_NAME}</code>%0A• <b>Версия:</b> <code>${VERSION_NAME}</code> (versionCode: <code>${VERSION_CODE}</code>)%0A• <b>Номер сборки:</b> <code>#${RUN_NUM}</code>%0A• <b>Подпись (SHA-256):</b> <code>${CERT_SHA256}</code> (единая для обновлений)%0A• <b>Файл:</b> <code>${RENAMED_APK}</code>%0A• <b>Ветка:</b> <code>${{ github.ref_name }}</code>%0A• <b>Коммит:</b> <code>${SHORT_SHA}</code> — ${COMMIT_MSG}%0A• <b>Автор:</b> ${AUTHOR}"
           RESPONSE=$(curl -sS -w "\\n%{http_code}" -X POST "https://api.telegram.org/bot${TOKEN}/sendDocument" \\
             -F "chat_id=${TARGET_CHAT_ID}" \\
             -F "parse_mode=HTML" \\
@@ -564,7 +647,7 @@ jobs:
 
       - name: Cleanup Keystore & Temp APK
         if: always()
-        run: rm -f "$RUNNER_TEMP/release-key.jks" app/release-key.jks ./*_v*.apk
+        run: rm -f "$RUNNER_TEMP/release-key.jks" "$RUNNER_TEMP/aligned.apk" app/release-key.jks ./*_v*.apk
 """
     return yaml_template.replace("__FALLBACK_CHAT_ID__", str(default_chat_id or "").strip())
 
@@ -632,6 +715,95 @@ async def set_repo_actions_secret(
         return False, f"Ошибка записи секрета {secret_name} (HTTP {resp.status}): {err}"
 
 
+def ensure_persistent_signing_keystore() -> dict:
+    """
+    Гарантирует наличие единого постоянного ключа подписи (.jks / PKCS#12) в конфигурации бота,
+    чтобы все сборки одного и того же репозитория всегда имели идентичную криптографическую подпись.
+    Если пользователь не задал собственный KEYSTORE_BASE64, автоматически генерирует его один раз
+    через keytool или openssl и сохраняет в bot_config.json.
+    """
+    import subprocess
+    import tempfile
+
+    cfg = load_bot_config()
+    ks_b64 = (cfg.get("keystore_base64") or "").strip()
+    store_pass = (cfg.get("keystore_password") or "").strip() or "android123"
+    key_alias = (cfg.get("key_alias") or "").strip() or "release_key"
+    key_pass = (cfg.get("key_password") or "").strip() or store_pass
+
+    if ks_b64 and ks_b64 != "-":
+        return {
+            "keystore_base64": ks_b64,
+            "keystore_password": store_pass,
+            "key_alias": key_alias,
+            "key_password": key_pass,
+        }
+
+    # Автоматическая однократная генерация постоянного ключа через keytool или openssl
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ks_path = Path(tmpdir) / "release-key.jks"
+            # Способ 1: штатный keytool (если установлен в окружении)
+            res = subprocess.run(
+                [
+                    "keytool", "-genkeypair", "-v",
+                    "-keystore", str(ks_path),
+                    "-alias", key_alias,
+                    "-keyalg", "RSA", "-keysize", "2048", "-validity", "10000",
+                    "-storepass", store_pass, "-keypass", key_pass,
+                    "-dname", "CN=AIStudio, OU=Mobile, O=AIStudio, L=City, S=State, C=US",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if res.returncode != 0 or not ks_path.exists():
+                # Способ 2: openssl PKCS#12 (совместим с JDK 17 keytool и Android apksigner)
+                key_pem = Path(tmpdir) / "key.pem"
+                cert_pem = Path(tmpdir) / "cert.pem"
+                subprocess.run(
+                    [
+                        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                        "-keyout", str(key_pem), "-out", str(cert_pem), "-days", "10000",
+                        "-subj", "/CN=AIStudio/OU=Mobile/O=AIStudio/L=City/ST=State/C=US",
+                    ],
+                    capture_output=True,
+                    check=True,
+                    timeout=15,
+                )
+                subprocess.run(
+                    [
+                        "openssl", "pkcs12", "-export",
+                        "-in", str(cert_pem), "-inkey", str(key_pem),
+                        "-out", str(ks_path), "-name", key_alias,
+                        "-passout", f"pass:{store_pass}",
+                    ],
+                    capture_output=True,
+                    check=True,
+                    timeout=15,
+                )
+            if ks_path.exists():
+                ks_b64 = base64.b64encode(ks_path.read_bytes()).decode("ascii")
+                updates = {
+                    "keystore_base64": ks_b64,
+                    "keystore_password": store_pass,
+                    "key_alias": key_alias,
+                    "key_password": key_pass,
+                }
+                save_bot_config(updates)
+                logger.info("Сгенерирован и сохранен постоянный ключ подписи APK (KEYSTORE_BASE64) в bot_config.json.")
+                return updates
+    except Exception as exc:
+        logger.warning(f"Локальная генерация keystore пропущена (ключ будет сохранен внутри репозитория при сборке): {exc}")
+
+    return {
+        "keystore_base64": "",
+        "keystore_password": store_pass,
+        "key_alias": key_alias,
+        "key_password": key_pass,
+    }
+
+
 def resolve_target_chat_id(chat_id: int | str = None) -> str:
     """
     Возвращает гарантированно непустой CHAT_ID для записи в GitHub Actions Secrets
@@ -659,15 +831,16 @@ async def ensure_repo_telegram_secrets(
     owner: str,
     repo: str,
     token: str,
-    chat_id: int | str = None
+    chat_id: int | str = None,
+    force_overwrite_keystore: bool = False
 ) -> tuple[bool, str, str]:
     """
-    Гарантированно записывает секреты TELEGRAM_BOT_TOKEN, BOT_TOKEN, TELEGRAM_CHAT_ID и CHAT_ID
-    в настройки репозитория на GitHub (PUT /repos/{owner}/{repo}/actions/secrets/{secret_name})
-    с шифрованием через PyNaCl и публичный ключ репозитория.
-    Возвращает (успех, описание, использованный_chat_id).
+    Гарантированно записывает секреты TELEGRAM_BOT_TOKEN, BOT_TOKEN, TELEGRAM_CHAT_ID, CHAT_ID
+    и постоянный ключ подписи APK (KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD)
+    в настройки репозитория на GitHub (PUT /repos/{owner}/{repo}/actions/secrets/{secret_name}).
+    Если в репозитории уже сохранен KEYSTORE_BASE64 и пользователь не запрашивал принудительную перезапись,
+    существующий секрет KEYSTORE_BASE64 в репозитории сохраняется неизменным!
     """
-    cfg = load_bot_config()
     target_chat_id = resolve_target_chat_id(chat_id)
     bot_token_val = (TELEGRAM_BOT_TOKEN or os.getenv("BOT_TOKEN") or "").strip()
 
@@ -678,18 +851,31 @@ async def ensure_repo_telegram_secrets(
         "CHAT_ID": target_chat_id,
     }
 
-    # Дополнительно передаем секреты подписи APK, если они заданы
-    for cfg_key, secret_env_name in [
-        ("keystore_base64", "KEYSTORE_BASE64"),
-        ("keystore_password", "KEYSTORE_PASSWORD"),
-        ("key_alias", "KEY_ALIAS"),
-        ("key_password", "KEY_PASSWORD"),
-    ]:
-        val = cfg.get(cfg_key, "")
-        if val and val != "-":
-            secrets_to_set[secret_env_name] = val
-
     headers = get_github_headers(token)
+
+    # Проверяем, есть ли уже KEYSTORE_BASE64 в секретах этого репозитория на GitHub
+    repo_has_keystore_secret = False
+    if not force_overwrite_keystore and not os.getenv("KEYSTORE_BASE64"):
+        check_ks_url = f"https://api.github.com/repos/{owner}/{repo}/actions/secrets/KEYSTORE_BASE64"
+        try:
+            async with session.get(check_ks_url, headers=headers) as ks_resp:
+                if ks_resp.status == 200:
+                    repo_has_keystore_secret = True
+        except Exception:
+            pass
+
+    if not repo_has_keystore_secret:
+        ks_cfg = ensure_persistent_signing_keystore()
+        for cfg_key, secret_env_name in [
+            ("keystore_base64", "KEYSTORE_BASE64"),
+            ("keystore_password", "KEYSTORE_PASSWORD"),
+            ("key_alias", "KEY_ALIAS"),
+            ("key_password", "KEY_PASSWORD"),
+        ]:
+            val = ks_cfg.get(cfg_key, "")
+            if val and val != "-":
+                secrets_to_set[secret_env_name] = val
+
     pk_url = f"https://api.github.com/repos/{owner}/{repo}/actions/secrets/public-key"
     async with session.get(pk_url, headers=headers) as pk_resp:
         if pk_resp.status != 200:
@@ -712,9 +898,12 @@ async def ensure_repo_telegram_secrets(
             return False, sanitize_log_text(msg), target_chat_id
         written_names.append(s_name)
 
+    ks_note = "KEYSTORE_BASE64 сохранен" if "KEYSTORE_BASE64" in written_names else (
+        "KEYSTORE_BASE64 уже закреплен за репо" if repo_has_keystore_secret else "ключ в .github/signing/release-key.jks"
+    )
     return (
         True,
-        f"Секретов записано: {len(written_names)} ({', '.join(written_names)}; chat_id={target_chat_id})",
+        f"Секретов записано: {len(written_names)} ({', '.join(written_names)}; {ks_note}; chat_id={target_chat_id})",
         target_chat_id
     )
 

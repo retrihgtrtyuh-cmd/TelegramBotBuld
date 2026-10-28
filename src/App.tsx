@@ -1382,7 +1382,27 @@ jobs:
             echo "sdk.dir=/usr/local/lib/android/sdk" > android/local.properties
           fi
 
-      - name: 2. Восстановление или генерация ключа подписи (.jks)
+      - name: Авто-увеличение версии приложения (versionCode и versionName)
+        id: version
+        run: |
+          VERSION_CODE="\${{ github.run_number }}"
+          VERSION_NAME="1.0.\${{ github.run_number }}"
+          for GRADLE_FILE in android/app/build.gradle android/app/build.gradle.kts app/build.gradle app/build.gradle.kts; do
+            if [ -f "\$GRADLE_FILE" ]; then
+              if [[ "\$GRADLE_FILE" == *.kts ]]; then
+                sed -i -E "s/versionCode[[:space:]]*=[[:space:]]*[0-9]+/versionCode = \${VERSION_CODE}/g" "\$GRADLE_FILE"
+                sed -i -E "s/versionName[[:space:]]*=[[:space:]]*\"[^\"]*\"/versionName = \"\${VERSION_NAME}\"/g" "\$GRADLE_FILE"
+              else
+                sed -i -E "s/versionCode[[:space:]]*=*[[:space:]]*[0-9]+/versionCode \${VERSION_CODE}/g" "\$GRADLE_FILE"
+                sed -i -E "s/versionName[[:space:]]*=*[[:space:]]*['\"][^'\"]*['\"]/versionName \"\${VERSION_NAME}\"/g" "\$GRADLE_FILE"
+              fi
+              echo "Обновлена версия в \$GRADLE_FILE -> versionCode=\${VERSION_CODE}, versionName=\${VERSION_NAME}"
+            fi
+          done
+          echo "version_code=\${VERSION_CODE}" >> \$GITHUB_OUTPUT
+          echo "version_name=\${VERSION_NAME}" >> \$GITHUB_OUTPUT
+
+      - name: 2. Постоянный ключ подписи (.jks) для обновления APK поверх старого без потери данных
         id: keystore
         env:
           KEYSTORE_BASE64: \${{ secrets.KEYSTORE_BASE64 }}
@@ -1390,19 +1410,30 @@ jobs:
           KEY_ALIAS: \${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: \${{ secrets.KEY_PASSWORD }}
         run: |
-          if [ -n "\$KEYSTORE_BASE64" ] && [ "\$KEYSTORE_BASE64" != "-" ] && [ -n "\$KEYSTORE_PASSWORD" ]; then
-            echo "\$KEYSTORE_BASE64" | base64 --decode > "\$RUNNER_TEMP/release-key.jks"
-            echo "store_file=\$RUNNER_TEMP/release-key.jks" >> \$GITHUB_OUTPUT
-            echo "store_password=\$KEYSTORE_PASSWORD" >> \$GITHUB_OUTPUT
-            echo "key_alias=\$KEY_ALIAS" >> \$GITHUB_OUTPUT
-            echo "key_password=\$KEY_PASSWORD" >> \$GITHUB_OUTPUT
+          STORE_FILE="\$RUNNER_TEMP/release-key.jks"
+          STORE_PASS="\${KEYSTORE_PASSWORD:-android123}"
+          ALIAS="\${KEY_ALIAS:-release_key}"
+          KEY_PASS="\${KEY_PASSWORD:-\$STORE_PASS}"
+          PERSISTED_REPO_KEYSTORE=".github/signing/release-key.jks"
+
+          if [ -n "\$KEYSTORE_BASE64" ] && [ "\$KEYSTORE_BASE64" != "-" ]; then
+            echo "\$KEYSTORE_BASE64" | tr -d '\\n\\r ' | base64 --decode > "\$STORE_FILE"
+          elif [ -f "\$PERSISTED_REPO_KEYSTORE" ]; then
+            cp "\$PERSISTED_REPO_KEYSTORE" "\$STORE_FILE"
           else
-            keytool -genkeypair -v -keystore "\$RUNNER_TEMP/release-key.jks" -alias release_key -keyalg RSA -keysize 2048 -validity 10000 -storepass android123 -keypass android123 -dname "CN=AIStudio, OU=Mobile, O=AIStudio, L=City, S=State, C=US"
-            echo "store_file=\$RUNNER_TEMP/release-key.jks" >> \$GITHUB_OUTPUT
-            echo "store_password=android123" >> \$GITHUB_OUTPUT
-            echo "key_alias=release_key" >> \$GITHUB_OUTPUT
-            echo "key_password=android123" >> \$GITHUB_OUTPUT
+            mkdir -p .github/signing
+            keytool -genkeypair -v -keystore "\$PERSISTED_REPO_KEYSTORE" -alias "\$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 -storepass "\$STORE_PASS" -keypass "\$KEY_PASS" -dname "CN=AIStudio, OU=Mobile, O=AIStudio, L=City, S=State, C=US"
+            cp "\$PERSISTED_REPO_KEYSTORE" "\$STORE_FILE"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -f "\$PERSISTED_REPO_KEYSTORE"
+            git commit -m "ci: persist Android release keystore for seamless APK updates [skip ci]" || true
+            git push origin "HEAD:\${GITHUB_REF_NAME}" || true
           fi
+          echo "store_file=\$STORE_FILE" >> \$GITHUB_OUTPUT
+          echo "store_password=\$STORE_PASS" >> \$GITHUB_OUTPUT
+          echo "key_alias=\$ALIAS" >> \$GITHUB_OUTPUT
+          echo "key_password=\$KEY_PASS" >> \$GITHUB_OUTPUT
 
       - name: Build Release APK with Gradle
         env:
@@ -1415,22 +1446,41 @@ jobs:
           echo "sdk.dir=/usr/local/lib/android/sdk" > local.properties
           chmod +x gradlew
           ./gradlew assembleRelease -x lint -x lintVitalRelease \\
+            -Pandroid.injected.invoked.from.ide=true \\
             -Pandroid.injected.signing.store.file="\${{ steps.keystore.outputs.store_file }}" \\
             -Pandroid.injected.signing.store.password="\${{ steps.keystore.outputs.store_password }}" \\
             -Pandroid.injected.signing.key.alias="\${{ steps.keystore.outputs.key_alias }}" \\
-            -Pandroid.injected.signing.key.password="\${{ steps.keystore.outputs.key_password }}" || ./gradlew assembleDebug -x lint
+            -Pandroid.injected.signing.key.password="\${{ steps.keystore.outputs.key_password }}" || ./gradlew assembleRelease -x lint -x lintVitalRelease || ./gradlew assembleDebug -x lint
 
-      - name: Извлечение информации о коммите и переименование APK ({имя_репозитория}_v{github.run_number}.apk)
+      - name: Подпись единым сертификатом (zipalign + apksigner V1/V2/V3) и переименование APK
         id: meta
+        env:
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
         run: |
           COMMIT_SHA=\$(git rev-parse HEAD)
           SHORT_SHA=\$(git rev-parse --short HEAD)
           COMMIT_AUTHOR=\$(git log -1 --pretty=format:'%an (%ae)')
           COMMIT_MSG=\$(git log -1 --pretty=format:'%s')
-          ORIG_APK=\$(find . -path "*/build/outputs/apk/*" -name "*.apk" ! -name "*-unsigned.apk" | head -n 1)
-          # Переименование под формат {имя_репозитория}_v{github.run_number}.apk
-          RENAMED_APK="\${{ github.event.repository.name }}_v\${{ github.run_number }}.apk"
-          cp "\${ORIG_APK}" "./\${RENAMED_APK}"
+          ORIG_APK=\$(find . -path "*/build/outputs/apk/release/*" -name "*.apk" | head -n 1)
+          if [ -z "\$ORIG_APK" ]; then
+            ORIG_APK=\$(find . -path "*/build/outputs/apk/*" -name "*.apk" | head -n 1)
+          fi
+          BUILD_TOOLS_DIR=\$(ls -d \${ANDROID_SDK_ROOT}/build-tools/* | sort -V | tail -n 1)
+          ZIPALIGN="\${BUILD_TOOLS_DIR}/zipalign"
+          APKSIGNER="\${BUILD_TOOLS_DIR}/apksigner"
+          RENAMED_APK="\${{ github.event.repository.name }}_v\${{ github.run_number }}_\${SHORT_SHA}.apk"
+          ALIGNED_APK="\$RUNNER_TEMP/aligned.apk"
+          "\$ZIPALIGN" -p -f 4 "\$ORIG_APK" "\$ALIGNED_APK"
+          "\$APKSIGNER" sign \\
+            --ks "\${{ steps.keystore.outputs.store_file }}" \\
+            --ks-key-alias "\${{ steps.keystore.outputs.key_alias }}" \\
+            --ks-pass "pass:\${{ steps.keystore.outputs.store_password }}" \\
+            --key-pass "pass:\${{ steps.keystore.outputs.key_password }}" \\
+            --v1-signing-enabled true \\
+            --v2-signing-enabled true \\
+            --v3-signing-enabled true \\
+            --out "./\${RENAMED_APK}" \\
+            "\$ALIGNED_APK"
           echo "commit_sha=\${COMMIT_SHA}" >> \$GITHUB_OUTPUT
           echo "short_sha=\${SHORT_SHA}" >> \$GITHUB_OUTPUT
           echo "author=\${COMMIT_AUTHOR}" >> \$GITHUB_OUTPUT
@@ -1441,7 +1491,7 @@ jobs:
       - name: 3A. Отправка APK на эндпоинт бота (Render / Railway / VPS)
         if: \${{ secrets.BOT_WEBHOOK_URL != '' }}
         run: |
-          RENAMED_APK="\${{ github.event.repository.name }}_v\${{ github.run_number }}.apk"
+          RENAMED_APK="\${{ steps.meta.outputs.apk_filename }}"
           curl -sS -X POST "\${{ secrets.BOT_WEBHOOK_URL }}/api/upload-apk" \\
             -H "X-Webhook-Secret: \${{ secrets.WEBHOOK_SECRET }}" \\
             -F "apk_file=@./\${RENAMED_APK}" \\
@@ -1463,8 +1513,8 @@ jobs:
         run: |
           TOKEN="\${TELEGRAM_BOT_TOKEN:-\$BOT_TOKEN}"
           TARGET_CHAT_ID="\${TELEGRAM_CHAT_ID:-\$CHAT_ID}"
-          RENAMED_APK="\${{ github.event.repository.name }}_v\${{ github.run_number }}.apk"
-          CAPTION="📦 <b>Сборка APK готова!</b>%0A• <b>Проект:</b> <code>\${{ github.event.repository.name }}</code>%0A• <b>Номер сборки:</b> <code>#\${{ github.run_number }}</code> (<code>v\${{ github.run_number }}</code>)%0A• <b>Файл:</b> <code>\${RENAMED_APK}</code>%0A• <b>Ветка:</b> <code>\${{ github.event.client_payload.branch || github.ref_name }}</code>%0A• <b>Автор:</b> \${{ steps.meta.outputs.author }}%0A• <b>Коммит:</b> <code>\${{ steps.meta.outputs.short_sha }}</code> — \${{ steps.meta.outputs.commit_msg }}%0A• <b>Бэкап:</b> <code>\${{ steps.backup.outputs.archive_name }}</code>"
+          RENAMED_APK="\${{ steps.meta.outputs.apk_filename }}"
+          CAPTION="📦 <b>Сборка APK готова!</b>%0A• <b>Проект:</b> <code>\${{ github.event.repository.name }}</code>%0A• <b>Версия:</b> <code>\${{ steps.version.outputs.version_name }}</code> (versionCode: <code>\${{ steps.version.outputs.version_code }}</code>)%0A• <b>Номер сборки:</b> <code>#\${{ github.run_number }}</code>%0A• <b>Файл:</b> <code>\${RENAMED_APK}</code>%0A• <b>Ветка:</b> <code>\${{ github.event.client_payload.branch || github.ref_name }}</code>%0A• <b>Автор:</b> \${{ steps.meta.outputs.author }}%0A• <b>Коммит:</b> <code>\${{ steps.meta.outputs.short_sha }}</code> — \${{ steps.meta.outputs.commit_msg }}"
           curl -sS -X POST "https://api.telegram.org/bot\${TOKEN}/sendDocument" \\
             -F "chat_id=\${TARGET_CHAT_ID}" \\
             -F "parse_mode=HTML" \\
@@ -1473,7 +1523,7 @@ jobs:
 
       - name: Удаление ключа подписи (.jks) и временного APK с раннера
         if: always()
-        run: rm -f app/release-key.jks ./*_v*_*.apk`;
+        run: rm -f "\$RUNNER_TEMP/release-key.jks" "\$RUNNER_TEMP/aligned.apk" app/release-key.jks ./*_v*_*.apk`;
 
   const envFileCode = `# 1. Telegram Bot API (получить у @BotFather)
 TELEGRAM_BOT_TOKEN="7123456789:AAH_your_bot_token_here"
