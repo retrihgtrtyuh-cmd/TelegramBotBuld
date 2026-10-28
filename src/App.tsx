@@ -843,50 +843,85 @@ export default function App() {
 
   // Dynamic Code Generators based on current user config
   const pythonBotCode = `import os
+import re
 import sys
 import hmac
 import logging
+from functools import wraps
+from typing import Callable, Dict, Any, Awaitable
 from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
 from aiohttp import web
-from aiogram import Bot, Dispatcher, Router
-from aiogram.types import Message, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram import Bot, Dispatcher, Router, BaseMiddleware
+from aiogram.types import Message, TelegramObject, CallbackQuery, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command, CommandObject
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 
-# Загружаем переменные окружения из файла .env через python-dotenv
+# Загружаем переменные окружения из .env (локально) или из Secrets (Hugging Face Spaces)
 ROOT_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(dotenv_path=ROOT_DIR / ".env")
-load_dotenv()  # Fallback, если .env лежит в папке bot/
+load_dotenv()
+
+_TOKEN_REGEXES = [
+    re.compile(r"gh[pousr]_[A-Za-z0-9_]{16,255}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{16,255}"),
+    re.compile(r"\\b\\d{8,12}:[A-Za-z0-9_-]{30,50}\\b"),
+]
+
+
+def sanitize_log_text(text: str) -> str:
+    if not text:
+        return ""
+    sanitized = str(text)
+    for env_key in ("TELEGRAM_BOT_TOKEN", "GITHUB_PAT", "WEBHOOK_SECRET"):
+        val = os.getenv(env_key, "").strip()
+        if val and len(val) >= 6:
+            sanitized = sanitized.replace(val, "***REDACTED***")
+    for pattern in _TOKEN_REGEXES:
+        sanitized = pattern.sub("***REDACTED***", sanitized)
+    return sanitized
+
+
+class SecretMaskingFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = sanitize_log_text(record.msg)
+        return True
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+for _h in logging.root.handlers:
+    _h.addFilter(SecretMaskingFilter())
 logger = logging.getLogger("apk-ci-bot")
 
-# Считываем конфигурацию строго из .env (по умолчанию retrihgtrtyuh-cmd/xianxia-sect-maneger)
+# Считываем конфигурацию строго из переменных окружения (Secrets) без хардкода
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_PAT")
-GITHUB_OWNER = os.getenv("GITHUB_OWNER", "retrihgtrtyuh-cmd")
-GITHUB_REPO = os.getenv("GITHUB_REPO", "xianxia-sect-maneger")
-GITHUB_WORKFLOW = os.getenv("GITHUB_WORKFLOW", "build-apk.yml")
+GITHUB_OWNER = os.getenv("GITHUB_OWNER", "")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "")
+GITHUB_WORKFLOW = os.getenv("GITHUB_WORKFLOW", "build-and-deploy.yml")
 GITHUB_DEFAULT_BRANCH = os.getenv("GITHUB_BRANCH", "main")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
-PORT = int(os.getenv("PORT", "8080"))
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+PORT = int(os.getenv("PORT", "7860"))
 DEV_LOG_PATH = Path(os.getenv("DEV_LOG_PATH", str(ROOT_DIR / "dev_log.md")))
 
-# ID разрешенных чатов и вашего приватного канала (-1003962969725)
-raw_chats = os.getenv("TELEGRAM_CHAT_IDS", "-1003962969725")
+raw_admin = os.getenv("ADMIN_ID", "").strip()
+ADMIN_ID: int = int(raw_admin) if raw_admin.lstrip("-").isdigit() else 0
+
+raw_chats = os.getenv("TELEGRAM_CHAT_IDS", "")
 AUTHORIZED_CHAT_IDS = {
     int(x.strip()) for x in raw_chats.split(",")
     if x.strip().lstrip("-").isdigit()
 }
-AUTHORIZED_CHAT_IDS.add(-1003962969725)
+if ADMIN_ID:
+    AUTHORIZED_CHAT_IDS.add(ADMIN_ID)
 
 if not TELEGRAM_BOT_TOKEN:
-    logger.critical("ОШИБКА: TELEGRAM_BOT_TOKEN не задан в .env!")
+    logger.critical("ОШИБКА: TELEGRAM_BOT_TOKEN не задан в Secrets!")
     sys.exit(1)
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -895,14 +930,57 @@ router = Router()
 dp.include_router(router)
 
 
-def is_authorized(chat_id: int) -> bool:
-    return chat_id in AUTHORIZED_CHAT_IDS
+def is_admin_user(user_id: int | None, chat_id: int | None = None) -> bool:
+    if user_id is not None:
+        return ADMIN_ID != 0 and user_id == ADMIN_ID
+    if chat_id is not None and chat_id < 0:
+        return chat_id in AUTHORIZED_CHAT_IDS
+    return False
+
+
+class AdminOnlyMiddleware(BaseMiddleware):
+    """Глобальный Outer Middleware: блокирует любые команды и нажатия кнопок, если from_user.id != ADMIN_ID."""
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        user = getattr(event, "from_user", None)
+        user_id = user.id if user else None
+        chat = getattr(event, "chat", None)
+        if chat is None and isinstance(event, CallbackQuery) and event.message:
+            chat = event.message.chat
+        chat_id = chat.id if chat else None
+
+        if not is_admin_user(user_id=user_id, chat_id=chat_id):
+            if isinstance(event, CallbackQuery):
+                await event.answer("⛔ Доступ запрещен.", show_alert=True)
+            return None
+        return await handler(event, data)
+
+
+router.message.outer_middleware(AdminOnlyMiddleware())
+router.callback_query.outer_middleware(AdminOnlyMiddleware())
+router.channel_post.outer_middleware(AdminOnlyMiddleware())
+
+
+def admin_only(func: Callable) -> Callable:
+    """Декоратор строгой проверки message.from_user.id == ADMIN_ID."""
+    @wraps(func)
+    async def wrapper(event: Message | CallbackQuery, *args, **kwargs):
+        user_id = event.from_user.id if event.from_user else None
+        chat_id = event.chat.id if isinstance(event, Message) else (event.message.chat.id if event.message else None)
+        if not is_admin_user(user_id=user_id, chat_id=chat_id):
+            return None
+        return await func(event, *args, **kwargs)
+    return wrapper
 
 
 def append_to_dev_log(entry: str) -> None:
     try:
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        line = f"\\n- **[{ts}]** {entry}\\n"
+        line = f"\\n- **[{ts}]** {sanitize_log_text(entry)}\\n"
         with open(DEV_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(line)
     except Exception as exc:
@@ -952,7 +1030,7 @@ async def set_repo_actions_secret(
     async with session.put(secret_url, json=payload, headers=headers) as resp:
         if resp.status in (201, 204):
             return True, "OK"
-        err = await resp.text()
+        err = sanitize_log_text(await resp.text())
         return False, f"HTTP {resp.status}: {err}"
 
 
@@ -964,12 +1042,12 @@ async def ensure_repo_telegram_secrets(
 ) -> tuple[bool, str]:
     """Автоматически записывает TELEGRAM_BOT_TOKEN/BOT_TOKEN и TELEGRAM_CHAT_ID/CHAT_ID в GitHub Actions Secrets."""
     if not GITHUB_TOKEN:
-        return False, "В .env не задан GITHUB_PAT"
+        return False, "В Secrets не задан GITHUB_PAT"
     target_chat_id = str(
         chat_id
         or os.getenv("TELEGRAM_CHAT_ID")
         or os.getenv("CHAT_ID")
-        or next(iter(AUTHORIZED_CHAT_IDS), "-1003962969725")
+        or next(iter(AUTHORIZED_CHAT_IDS), str(ADMIN_ID))
     )
     secrets_to_set = {
         "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
@@ -1011,7 +1089,7 @@ async def setup_auto_apk_for_repo(owner: str, repo: str, chat_id: int) -> tuple[
 
 async def trigger_github_workflow(branch: str, notes: str, initiated_by: str, chat_id: int = None) -> tuple[bool, str]:
     if not GITHUB_TOKEN:
-        return False, "В .env не задан GITHUB_PAT"
+        return False, "В Secrets не задан GITHUB_PAT"
 
     headers = {
         "Accept": "application/vnd.github+json",
@@ -1020,7 +1098,6 @@ async def trigger_github_workflow(branch: str, notes: str, initiated_by: str, ch
         "User-Agent": "Telegram-APK-Build-Bot/1.0"
     }
 
-    # 1. Перед запуском сборки гарантированно записываем секреты TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID
     url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows/{GITHUB_WORKFLOW}/dispatches"
     payload = {"ref": branch, "inputs": {"notes": f"{notes} ({initiated_by})"}}
 
@@ -1030,9 +1107,8 @@ async def trigger_github_workflow(branch: str, notes: str, initiated_by: str, ch
         async with session.post(url, json=payload, headers=headers) as resp:
             if resp.status == 204:
                 return True, f"Workflow {GITHUB_WORKFLOW} запущен в {GITHUB_OWNER}/{GITHUB_REPO} (HTTP 204)"
-            err = await resp.text()
+            err = sanitize_log_text(await resp.text())
 
-        # 2. Резервный вызов repository_dispatch
         disp_url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/dispatches"
         disp_payload = {
             "event_type": "build_apk",
@@ -1041,13 +1117,13 @@ async def trigger_github_workflow(branch: str, notes: str, initiated_by: str, ch
         async with session.post(disp_url, json=disp_payload, headers=headers) as resp:
             if resp.status == 204:
                 return True, f"Dispatch запущен в {GITHUB_OWNER}/{GITHUB_REPO} (HTTP 204)"
-            second_err = await resp.text()
+            second_err = sanitize_log_text(await resp.text())
             return False, f"HTTP {resp.status}: {second_err}"
 
 
-# Обработчики работают И в личке (message), И в канале (channel_post)
 @router.message(Command("start"))
 @router.channel_post(Command("start"))
+@admin_only
 async def cmd_start(message: Message):
     await message.answer(
         f"<b>CI/CD Бот управления сборкой APK</b>\\n\\n"
@@ -1062,11 +1138,8 @@ async def cmd_start(message: Message):
 
 @router.message(Command("build"))
 @router.channel_post(Command("build"))
+@admin_only
 async def cmd_build(message: Message, command: CommandObject):
-    if not is_authorized(message.chat.id):
-        await message.answer(f"⛔ Chat ID {message.chat.id} не авторизован.")
-        return
-
     args = (command.args or "").split(maxsplit=1)
     branch = args[0] if len(args) >= 1 else GITHUB_DEFAULT_BRANCH
     notes = args[1] if len(args) >= 2 else "Ручной запуск сборки из Telegram"
@@ -1106,41 +1179,41 @@ async def cmd_build(message: Message, command: CommandObject):
 
 @router.message(Command("status"))
 @router.channel_post(Command("status"))
+@admin_only
 async def cmd_status(message: Message):
-    if not is_authorized(message.chat.id):
-        return
-    # Проверка статуса на GitHub API...
     await message.answer(f"📊 Мониторинг репозитория: {GITHUB_OWNER}/{GITHUB_REPO}")
 
 
 @router.message(Command("log"))
 @router.channel_post(Command("log"))
+@admin_only
 async def cmd_log(message: Message, command: CommandObject):
-    if not is_authorized(message.chat.id):
-        return
     if command.args:
         append_to_dev_log(command.args.strip())
         await message.answer(f"📝 Запись добавлена в dev_log.md.")
     elif DEV_LOG_PATH.exists():
-        text = DEV_LOG_PATH.read_text(encoding="utf-8")[-1500:]
+        text = sanitize_log_text(DEV_LOG_PATH.read_text(encoding="utf-8")[-1500:])
         await message.answer(f"📖 <b>dev_log.md:</b>\\n<pre>{text}</pre>")
 
 
-# Корневой маршрут GET / для Render (отвечает 200 OK "Bot is alive")
 async def handle_root(request: web.Request) -> web.Response:
     return web.Response(text="Bot is alive", status=200, content_type="text/plain")
 
 
 async def handle_health(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "bot": "alive", "repo": f"{GITHUB_OWNER}/{GITHUB_REPO}"})
+    return web.json_response({"status": "ok", "bot": "alive"})
 
 
 async def handle_upload_apk(request: web.Request) -> web.Response:
+    secret_header = request.headers.get("X-Webhook-Secret", "")
+    if not WEBHOOK_SECRET or not hmac.compare_digest(secret_header, WEBHOOK_SECRET):
+        return web.json_response({"error": "Forbidden"}, status=403)
+
     reader = await request.multipart()
     apk_bytes = None
     apk_filename = ""
     meta = {
-        "repo_name": GITHUB_REPO,
+        "repo_name": GITHUB_REPO or "project",
         "commit_sha": "unknown",
         "commit_msg": "Без описания",
         "author": "unknown",
@@ -1159,7 +1232,7 @@ async def handle_upload_apk(request: web.Request) -> web.Response:
         return web.json_response({"error": "apk_file missing"}, status=400)
 
     short_sha = meta["commit_sha"][:7]
-    repo_name = meta["repo_name"] or GITHUB_REPO
+    repo_name = meta["repo_name"] or GITHUB_REPO or "project"
     build_num = meta["build_number"]
     if not apk_filename or apk_filename == "app-release.apk":
         apk_filename = f"{repo_name}_v{build_num}_{short_sha}.apk"

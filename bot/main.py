@@ -1,18 +1,22 @@
 import os
+import re
 import sys
 import json
 import hmac
 import base64
 import asyncio
 import logging
+from functools import wraps
+from typing import Callable, Dict, Any, Awaitable
 from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
 from aiohttp import web
-from aiogram import Bot, Dispatcher, Router, F
+from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
 from aiogram.types import (
     Message,
+    TelegramObject,
     BufferedInputFile,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
@@ -31,43 +35,109 @@ try:
 except ImportError:
     HAS_NACL = False
 
-# Загружаем переменные окружения из .env (в корне проекта и в папке bot/)
+# Загружаем переменные окружения из .env (только для локальной разработки; в Hugging Face берутся из Secrets)
 ROOT_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(dotenv_path=ROOT_DIR / ".env")
 load_dotenv()
 
-# Настройка логирования
+
+# =====================================================================
+# 0. ЗАЩИТА ЛОГОВ ОТ УТЕЧКИ ТОКЕНОВ И СЕКРЕТОВ В ПУБЛИЧНЫХ ПРОСТРАНСТВАХ
+# =====================================================================
+
+_TOKEN_REGEXES = [
+    re.compile(r"gh[pousr]_[A-Za-z0-9_]{16,255}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{16,255}"),
+    re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{30,50}\b"),
+    re.compile(r"(Bearer\s+)[A-Za-z0-9_\-\.]+", re.IGNORECASE),
+]
+
+
+def sanitize_log_text(text: str) -> str:
+    """Маскирует токены GitHub, Telegram и секреты перед выводом в логи или сообщения об ошибках."""
+    if not text:
+        return ""
+    sanitized = str(text)
+    for env_key in (
+        "TELEGRAM_BOT_TOKEN",
+        "BOT_TOKEN",
+        "GITHUB_PAT",
+        "WEBHOOK_SECRET",
+        "KEYSTORE_PASSWORD",
+        "KEY_PASSWORD",
+        "KEYSTORE_BASE64",
+    ):
+        secret_val = os.getenv(env_key, "").strip()
+        if secret_val and len(secret_val) >= 6:
+            sanitized = sanitized.replace(secret_val, "***REDACTED***")
+    for pattern in _TOKEN_REGEXES:
+        sanitized = pattern.sub("***REDACTED***", sanitized)
+    return sanitized
+
+
+class SecretMaskingFilter(logging.Filter):
+    """Фильтр логирования, исключающий попадание токенов и секретов в stdout контейнера (Hugging Face Spaces)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = sanitize_log_text(record.msg)
+        if record.args:
+            record.args = tuple(
+                sanitize_log_text(str(a)) if isinstance(a, str) else a
+                for a in (record.args if isinstance(record.args, tuple) else (record.args,))
+            )
+        return True
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
+for _handler in logging.root.handlers:
+    _handler.addFilter(SecretMaskingFilter())
 logger = logging.getLogger("apk-ci-bot")
+logger.addFilter(SecretMaskingFilter())
 
-# Пути к локальным JSON-хранилищам и логам
+# Пути к локальным JSON-хранилищам и логам (исключены через .gitignore)
 CONFIG_JSON_PATH = ROOT_DIR / "bot_config.json"
 KNOWN_REPOS_PATH = ROOT_DIR / "known_repos.json"
 DEV_LOG_PATH = Path(os.getenv("DEV_LOG_PATH", str(ROOT_DIR / "dev_log.md")))
 
 # =====================================================================
-# 1. ЕДИНОЕ ХРАНИЛИЩЕ КОНФИГУРАЦИИ И СЕКРЕТОВ (ИЗ КОДА/.ENV + BOT_CONFIG.JSON)
+# 1. ЕДИНОЕ ХРАНИЛИЩЕ КОНФИГУРАЦИИ И ИЗОЛЯЦИЯ ДОСТУПА (ТОЛЬКО ADMIN_ID)
 # =====================================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-PORT = int(os.getenv("PORT", "8080"))
+# Hugging Face Spaces по умолчанию слушает порт 7860
+PORT = int(os.getenv("PORT", "7860"))
 
-# Разрешенные ID чатов и приватного канала (-1003962969725)
-raw_chat_ids = os.getenv("TELEGRAM_CHAT_IDS", "-1003962969725")
-AUTHORIZED_CHAT_IDS = {
+# Строгая идентификация владельца бота через ADMIN_ID (без зашитых в код личных ID)
+raw_admin_id = os.getenv("ADMIN_ID", "").strip()
+ADMIN_ID: int = int(raw_admin_id) if raw_admin_id.lstrip("-").isdigit() else 0
+
+raw_chat_ids = os.getenv("TELEGRAM_CHAT_IDS", "")
+AUTHORIZED_CHAT_IDS: set[int] = {
     int(x.strip()) for x in raw_chat_ids.split(",")
     if x.strip().lstrip("-").isdigit()
 }
-AUTHORIZED_CHAT_IDS.add(-1003962969725)
+single_chat_id = os.getenv("TELEGRAM_CHAT_ID", "") or os.getenv("CHAT_ID", "")
+if single_chat_id.strip().lstrip("-").isdigit():
+    AUTHORIZED_CHAT_IDS.add(int(single_chat_id.strip()))
+if ADMIN_ID:
+    AUTHORIZED_CHAT_IDS.add(ADMIN_ID)
+
+ADMIN_USER_IDS: set[int] = {
+    uid for uid in AUTHORIZED_CHAT_IDS if uid > 0
+}
+if ADMIN_ID > 0:
+    ADMIN_USER_IDS.add(ADMIN_ID)
 
 
 def load_bot_config() -> dict:
     """
-    Собирает все существующие токены, Chat ID, GitHub логин и данные подписи APK
-    из переменных окружения и дополняет их сохраненными данными из bot_config.json.
+    Считывает все чувствительные параметры строго из переменных окружения (Secrets)
+    и при наличии локального bot_config.json дополняет их.
+    Никакие личные имена репозиториев или Chat ID не зашиты в исходный код.
     """
     raw_env_ids = [
         x.strip() for x in os.getenv("TELEGRAM_CHAT_IDS", "").split(",")
@@ -76,13 +146,13 @@ def load_bot_config() -> dict:
     default_chat_id = (
         os.getenv("TELEGRAM_CHAT_ID")
         or os.getenv("CHAT_ID")
-        or (raw_env_ids[0] if raw_env_ids else "")
+        or (raw_env_ids[0] if raw_env_ids else (str(ADMIN_ID) if ADMIN_ID else ""))
     )
     base_cfg = {
         "github_pat": os.getenv("GITHUB_PAT", ""),
-        "github_owner": os.getenv("GITHUB_OWNER", "retrihgtrtyuh-cmd"),
-        "github_repo": os.getenv("GITHUB_REPO", "xianxia-sect-maneger"),
-        "github_workflow": os.getenv("GITHUB_WORKFLOW", "build-apk.yml"),
+        "github_owner": os.getenv("GITHUB_OWNER", ""),
+        "github_repo": os.getenv("GITHUB_REPO", ""),
+        "github_workflow": os.getenv("GITHUB_WORKFLOW", "build-and-deploy.yml"),
         "github_branch": os.getenv("GITHUB_BRANCH", "main"),
         "telegram_chat_id": default_chat_id,
         "webhook_secret": os.getenv("WEBHOOK_SECRET", ""),
@@ -150,7 +220,7 @@ def save_known_repos(repos: set[str]) -> None:
 
 
 if not TELEGRAM_BOT_TOKEN:
-    logger.critical("ОШИБКА: TELEGRAM_BOT_TOKEN не задан в .env!")
+    logger.critical("ОШИБКА: TELEGRAM_BOT_TOKEN не задан в переменных окружения (Secrets)!")
     sys.exit(1)
 
 bot = Bot(
@@ -161,21 +231,90 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# Состояние ожидания интерактивного ввода от пользователя в Telegram:
-# chat_id -> {"field": "github_pat" | ..., "pending_action": "apk" | "pages" | None, "repo": str | None}
+# Состояние ожидания интерактивного ввода от пользователя в Telegram
 PENDING_INPUT_STATE: dict[int, dict] = {}
 
 
-def is_authorized(chat_id: int) -> bool:
-    """Проверка доступа: разрешает команды из личных чатов админа и канала."""
-    return chat_id in AUTHORIZED_CHAT_IDS
+def is_admin_user(user_id: int | None, chat_id: int | None = None) -> bool:
+    """
+    Строгая проверка администратора:
+    1) Если событие инициировано пользователем (Message / CallbackQuery) — проверяется user_id == ADMIN_ID (или в ADMIN_USER_IDS).
+    2) Если это пост в авторизованном канале (channel_post без from_user) — проверяется chat_id in AUTHORIZED_CHAT_IDS.
+    """
+    if user_id is not None:
+        if ADMIN_ID and user_id == ADMIN_ID:
+            return True
+        if user_id in ADMIN_USER_IDS:
+            return True
+        return False
+    if chat_id is not None and chat_id < 0 and chat_id in AUTHORIZED_CHAT_IDS:
+        return True
+    return False
+
+
+def is_authorized(chat_id: int, user_id: int | None = None) -> bool:
+    """Проверка доступа для чата и пользователя."""
+    if user_id is not None:
+        return is_admin_user(user_id, chat_id)
+    return chat_id in AUTHORIZED_CHAT_IDS or (ADMIN_ID != 0 and chat_id == ADMIN_ID)
+
+
+class AdminOnlyMiddleware(BaseMiddleware):
+    """
+    Глобальный Outer Middleware изоляции доступа:
+    Блокирует ВСЕ входящие команды, текстовые сообщения, загрузку файлов и нажатия инлайн-кнопок
+    от любых пользователей, чей from_user.id != ADMIN_ID.
+    Чужие запросы молча игнорируются до вызова любого хэндлера.
+    """
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        user = getattr(event, "from_user", None)
+        user_id = user.id if user else None
+        chat = getattr(event, "chat", None)
+        if chat is None and isinstance(event, CallbackQuery) and event.message:
+            chat = event.message.chat
+        chat_id = chat.id if chat else None
+
+        if not is_admin_user(user_id=user_id, chat_id=chat_id):
+            if isinstance(event, CallbackQuery):
+                try:
+                    await event.answer("⛔ Доступ запрещен.", show_alert=True)
+                except Exception:
+                    pass
+            return None
+
+        return await handler(event, data)
+
+
+# Регистрируем глобальную защиту на уровне роутера для всех типов событий
+router.message.outer_middleware(AdminOnlyMiddleware())
+router.callback_query.outer_middleware(AdminOnlyMiddleware())
+router.channel_post.outer_middleware(AdminOnlyMiddleware())
+
+
+def admin_only(func: Callable) -> Callable:
+    """Дополнительный декоратор для явной защиты отдельных хэндлеров (проверка from_user.id == ADMIN_ID)."""
+    @wraps(func)
+    async def wrapper(event: Message | CallbackQuery, *args, **kwargs):
+        user_id = event.from_user.id if event.from_user else None
+        chat_id = event.chat.id if isinstance(event, Message) else (event.message.chat.id if event.message else None)
+        if not is_admin_user(user_id=user_id, chat_id=chat_id):
+            return None
+        return await func(event, *args, **kwargs)
+    return wrapper
 
 
 def append_to_dev_log(entry: str) -> None:
-    """Фиксирует событие в корневом файле dev_log.md."""
+    """Фиксирует событие в локальном файле dev_log.md (с фильтрацией секретов)."""
     try:
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        line = f"\n- **[{timestamp}]** {entry}\n"
+        safe_entry = sanitize_log_text(entry)
+        line = f"\n- **[{timestamp}]** {safe_entry}\n"
         if DEV_LOG_PATH.exists():
             with open(DEV_LOG_PATH, "a", encoding="utf-8") as f:
                 f.write(line)
@@ -494,21 +633,25 @@ async def set_repo_actions_secret(
 
 
 def resolve_target_chat_id(chat_id: int | str = None) -> str:
-    """Возвращает гарантированно непустой CHAT_ID для записи в GitHub Actions Secrets."""
+    """
+    Возвращает гарантированно непустой CHAT_ID для записи в GitHub Actions Secrets
+    без добавления посторонних ID в AUTHORIZED_CHAT_IDS.
+    """
     cfg = load_bot_config()
     configured_chat_id = str(cfg.get("telegram_chat_id") or "").strip()
     if chat_id and str(chat_id).strip():
         target = str(chat_id).strip()
-        if not configured_chat_id or configured_chat_id == "-1003962969725":
-            save_bot_config({"telegram_chat_id": target})
-        if target.lstrip("-").isdigit():
-            AUTHORIZED_CHAT_IDS.add(int(target))
-        return target
+        if target.lstrip("-").isdigit() and int(target) in AUTHORIZED_CHAT_IDS:
+            if not configured_chat_id:
+                save_bot_config({"telegram_chat_id": target})
+            return target
     if configured_chat_id:
         return configured_chat_id
     if AUTHORIZED_CHAT_IDS:
         return str(next(iter(AUTHORIZED_CHAT_IDS)))
-    return "-1003962969725"
+    if ADMIN_ID:
+        return str(ADMIN_ID)
+    return ""
 
 
 async def ensure_repo_telegram_secrets(
@@ -550,7 +693,7 @@ async def ensure_repo_telegram_secrets(
     pk_url = f"https://api.github.com/repos/{owner}/{repo}/actions/secrets/public-key"
     async with session.get(pk_url, headers=headers) as pk_resp:
         if pk_resp.status != 200:
-            err = await pk_resp.text()
+            err = sanitize_log_text(await pk_resp.text())
             return (
                 False,
                 f"Не удалось получить публичный ключ секретов {owner}/{repo} (HTTP {pk_resp.status}): {err}",
@@ -566,7 +709,7 @@ async def ensure_repo_telegram_secrets(
             session, owner, repo, token, s_name, s_val, cached_pk=cached_pk
         )
         if not ok:
-            return False, msg, target_chat_id
+            return False, sanitize_log_text(msg), target_chat_id
         written_names.append(s_name)
 
     return (
@@ -622,7 +765,7 @@ async def create_or_update_workflow_file(
     async with session.put(url, json=payload, headers=headers) as resp:
         if resp.status in (200, 201):
             return True, path
-        err = await resp.text()
+        err = sanitize_log_text(await resp.text())
         return False, f"Ошибка создания файла воркфлоу (HTTP {resp.status}): {err}"
 
 
@@ -708,7 +851,7 @@ async def enable_github_pages_for_repo(owner: str, repo: str) -> tuple[bool, str
                         site_url = g_data.get("html_url") or site_url
                 return True, site_url
             else:
-                err = await resp.text()
+                err = sanitize_log_text(await resp.text())
                 return False, f"Ошибка GitHub Pages API (HTTP {resp.status}): {err}"
 
 
@@ -726,17 +869,18 @@ async def trigger_github_workflow(
     """
     cfg = load_bot_config()
     token = cfg.get("github_pat", "")
-    owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
-    repo = repo_override or cfg.get("github_repo", "xianxia-sect-maneger")
-    configured_wf = cfg.get("github_workflow", "build-apk.yml")
+    owner = cfg.get("github_owner", "")
+    repo = repo_override or cfg.get("github_repo", "")
+    configured_wf = cfg.get("github_workflow", "build-and-deploy.yml")
     target_branch = branch or cfg.get("github_branch", "main")
 
     if not token:
         return False, "Токен GitHub (GITHUB_PAT) еще не задан. Отправьте /token или нажмите кнопку настройки токена."
+    if not owner or not repo:
+        return False, "Не заданы GITHUB_OWNER или GITHUB_REPO в настройках (Secrets)."
 
     headers = get_github_headers(token)
 
-    # Список возможных файлов воркфлоу (чтобы работало и со старым build-apk.yml, и с новым build-and-deploy.yml)
     workflows_to_try = []
     for wf in [configured_wf, "build-and-deploy.yml", "build-apk.yml"]:
         if wf and wf not in workflows_to_try:
@@ -763,8 +907,8 @@ async def trigger_github_workflow(
             async with session.post(workflow_url, json=payload, headers=headers) as resp:
                 if resp.status == 204:
                     return True, f"Workflow {wf_name} успешно запущен в {owner}/{repo} (HTTP 204)."
-                last_err = await resp.text()
-                logger.warning(f"workflow_dispatch ({wf_name}) для {owner}/{repo} вернул HTTP {resp.status}: {last_err}")
+                last_err = sanitize_log_text(await resp.text())
+                logger.warning(f"workflow_dispatch ({wf_name}) вернул HTTP {resp.status}")
 
         # Fallback: пробуем без inputs на случай, если в YAML не описаны inputs
         for wf_name in workflows_to_try:
@@ -787,7 +931,7 @@ async def trigger_github_workflow(
         async with session.post(dispatch_url, json=dispatch_payload, headers=headers) as resp:
             if resp.status == 204:
                 return True, f"Repository dispatch успешно отправлен в {owner}/{repo} (HTTP 204)."
-            second_err = await resp.text()
+            second_err = sanitize_log_text(await resp.text())
             return False, (
                 f"Не удалось запустить воркфлоу в {owner}/{repo} (HTTP {resp.status}). "
                 f"Если в этом репозитории еще не настроена автосборка, нажмите «📱 Подключить автосборку APK» в карточке репозитория. "
@@ -806,8 +950,8 @@ def get_new_repo_card_keyboard(repo_name: str, is_new_notification: bool = False
     включить GitHub Pages или сделать этот репозиторий основным.
     """
     cfg = load_bot_config()
-    active_repo = cfg.get("github_repo", "xianxia-sect-maneger")
-    is_active = (repo_name == active_repo)
+    active_repo = cfg.get("github_repo", "")
+    is_active = bool(active_repo and repo_name == active_repo)
 
     rows = [
         [
@@ -916,10 +1060,12 @@ def get_repos_list_keyboard(repo_names: list[str]) -> InlineKeyboardMarkup:
     чтобы можно было открыть любой из них и настроить автосборку APK или Pages.
     """
     cfg = load_bot_config()
-    active_repo = cfg.get("github_repo", "xianxia-sect-maneger")
+    active_repo = cfg.get("github_repo", "")
     rows = []
 
     for r_name in repo_names:
+        if not r_name:
+            continue
         prefix = "⭐ " if r_name == active_repo else "📦 "
         suffix = " (основной)" if r_name == active_repo else ""
         rows.append([
@@ -977,12 +1123,14 @@ def get_back_to_setup_keyboard(repo_name: str = None) -> InlineKeyboardMarkup:
 
 async def fetch_public_repos(owner: str, token: str = "") -> list[dict]:
     """Получает список репозиториев профиля GitHub."""
+    if not owner:
+        return []
     url = f"https://api.github.com/users/{owner}/repos?type=public&sort=updated&direction=desc&per_page=50"
     headers = get_github_headers(token)
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers) as resp:
             if resp.status != 200:
-                logger.warning(f"Не удалось получить список репозиториев {owner}: HTTP {resp.status}")
+                logger.warning(f"Не удалось получить список репозиториев: HTTP {resp.status}")
                 return []
             data = await resp.json()
             return data if isinstance(data, list) else []
@@ -994,8 +1142,8 @@ async def get_all_tracked_repos_view() -> tuple[str, InlineKeyboardMarkup]:
     для выбора ЛЮБОГО из существующих репозиториев пользователя.
     """
     cfg = load_bot_config()
-    owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
-    active_repo = cfg.get("github_repo", "xianxia-sect-maneger")
+    owner = cfg.get("github_owner", "")
+    active_repo = cfg.get("github_repo", "")
     token = cfg.get("github_pat", "")
 
     repos_data = await fetch_public_repos(owner, token)
@@ -1005,14 +1153,13 @@ async def get_all_tracked_repos_view() -> tuple[str, InlineKeyboardMarkup]:
         fetched_names = [r["name"] for r in repos_data if r.get("name")]
         merged_set = set(fetched_names) | known_names
         save_known_repos(merged_set)
-        # Сохраняем порядок с GitHub (сначала самые свежие), плюс остальные из known_repos
         ordered_repos = fetched_names + [n for n in sorted(known_names) if n not in fetched_names]
     else:
-        ordered_repos = sorted(list(known_names)) if known_names else [active_repo]
+        ordered_repos = sorted(list(known_names)) if known_names else ([active_repo] if active_repo else [])
 
     text = (
-        f"📂 <b>Ваши репозитории в профиле <code>{owner}</code> ({len(ordered_repos)} шт.):</b>\n\n"
-        f"• <b>Основной проект по умолчанию:</b> <code>{active_repo}</code> (отмечен ⭐)\n\n"
+        f"📂 <b>Ваши репозитории в профиле <code>{owner or 'не задан'}</code> ({len(ordered_repos)} шт.):</b>\n\n"
+        f"• <b>Основной проект по умолчанию:</b> <code>{active_repo or 'не выбран'}</code> (отмечен ⭐)\n\n"
         f"👇 <b>Нажмите на любой репозиторий ниже</b>, чтобы:\n"
         f"— 📱 В 1 клик подключить ему автосборку APK (создать workflow + секреты)\n"
         f"— 🚀 Запустить сборку APK для него прямо сейчас\n"
@@ -1024,18 +1171,21 @@ async def get_all_tracked_repos_view() -> tuple[str, InlineKeyboardMarkup]:
 
 async def check_for_new_repositories(manual_trigger_chat_id: int = None) -> None:
     """
-    Проверяет появление новых публичных репозиториев.
-    При ручном вызове из чата всегда показывает список ВСЕХ доступных репозиториев кнопками!
+    Проверяет появление новых репозиториев.
+    При ручном вызове из чата всегда показывает список ВСЕХ доступных репозиториев кнопками.
     """
     cfg = load_bot_config()
-    owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
+    owner = cfg.get("github_owner", "")
     token = cfg.get("github_pat", "")
+    if not owner:
+        return
 
     repos_data = await fetch_public_repos(owner, token)
     if not repos_data:
         if manual_trigger_chat_id:
             known_names, _ = load_known_repos()
-            fallback_list = sorted(list(known_names)) if known_names else [cfg.get("github_repo", "xianxia-sect-maneger")]
+            active_repo = cfg.get("github_repo", "")
+            fallback_list = sorted(list(known_names)) if known_names else ([active_repo] if active_repo else [])
             await bot.send_message(
                 manual_trigger_chat_id,
                 f"⚠️ Не удалось обновить список с GitHub для <code>{owner}</code>. Показаны сохраненные репозитории:",
@@ -1047,7 +1197,6 @@ async def check_for_new_repositories(manual_trigger_chat_id: int = None) -> None
     current_names = set(fetched_names)
     known_names, initialized = load_known_repos()
 
-    # Первый старт: запоминаем текущие репозитории
     if not initialized:
         save_known_repos(current_names)
         logger.info(f"Инициализирован known_repos.json: запомнено {len(current_names)} существующих репозиториев.")
@@ -1072,11 +1221,9 @@ async def check_for_new_repositories(manual_trigger_chat_id: int = None) -> None
             )
         return
 
-    # Сохраняем обновленный список, чтобы не присылать карточку повторно
     known_names.update(new_names)
     save_known_repos(known_names)
 
-    # Отправляем карточку по каждому новому репозиторию и сразу записываем секреты в GitHub Actions Secrets
     async with aiohttp.ClientSession() as session:
         for r in repos_data:
             r_name = r.get("name")
@@ -1162,11 +1309,11 @@ def get_main_menu_text(chat_id: int) -> str:
     """Текст главного меню управления ботом."""
     cfg = load_bot_config()
     known_repos, _ = load_known_repos()
-    auth_status = "Доступ разрешен" if is_authorized(chat_id) else "Нет в списке разрешенных"
+    auth_status = "Доступ разрешен (Admin)" if is_authorized(chat_id) else "Нет в списке разрешенных"
     return (
         f"<b>CI/CD Панель управления сборкой APK и репозиториями</b>\n\n"
-        f"• <b>Профиль GitHub:</b> <code>{cfg.get('github_owner')}</code>\n"
-        f"• <b>Активный проект:</b> <code>{cfg.get('github_repo')}</code>\n"
+        f"• <b>Профиль GitHub:</b> <code>{cfg.get('github_owner') or 'не задан'}</code>\n"
+        f"• <b>Активный проект:</b> <code>{cfg.get('github_repo') or 'не выбран'}</code>\n"
         f"• <b>Всего репозиториев в базе:</b> <code>{len(known_repos)}</code> (автопроверка каждые 3 мин)\n"
         f"• <b>Текущий Chat ID:</b> <code>{chat_id}</code> ({auth_status})\n\n"
         f"Нажмите <b>«📂 Все мои репозитории»</b>, чтобы настроить автосборку APK или запустить билд для любого из ваших проектов:"
@@ -1176,8 +1323,8 @@ def get_main_menu_text(chat_id: int) -> str:
 def get_start_inline_keyboard() -> InlineKeyboardMarkup:
     """Инлайн-кнопки под приветственным сообщением."""
     cfg = load_bot_config()
-    owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
-    repo = cfg.get("github_repo", "xianxia-sect-maneger")
+    owner = cfg.get("github_owner") or "github"
+    repo = cfg.get("github_repo") or "repository"
     known_repos, _ = load_known_repos()
     count_label = f" ({len(known_repos)})" if known_repos else ""
     return InlineKeyboardMarkup(
@@ -1286,16 +1433,11 @@ async def perform_build(
 ):
     """Выполняет запуск сборки APK для выбранного (или активного) репозитория."""
     if not is_authorized(chat_id):
-        text = f"⛔ Chat ID <code>{chat_id}</code> не авторизован для запуска сборки."
-        if reply_to_message:
-            await reply_to_message.answer(text, reply_markup=get_back_to_main_keyboard())
-        else:
-            await bot.send_message(chat_id, text, reply_markup=get_back_to_main_keyboard())
         return
 
     cfg = load_bot_config()
-    owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
-    repo = repo_override or cfg.get("github_repo", "xianxia-sect-maneger")
+    owner = cfg.get("github_owner", "")
+    repo = repo_override or cfg.get("github_repo", "")
 
     init_text = (
         f"⏳ Запускаю сборку APK в репозитории "
@@ -1373,8 +1515,8 @@ async def get_status_text(repo_override: str = None) -> tuple[str, InlineKeyboar
     """Запрашивает статус последнего запуска на GitHub Actions для выбранного или активного репозитория."""
     cfg = load_bot_config()
     token = cfg.get("github_pat", "")
-    owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
-    repo = repo_override or cfg.get("github_repo", "xianxia-sect-maneger")
+    owner = cfg.get("github_owner", "")
+    repo = repo_override or cfg.get("github_repo", "")
 
     refresh_cb = f"repo_status:{repo}" if repo_override else "cb_status"
     back_row = [
@@ -1449,10 +1591,10 @@ async def get_status_text(repo_override: str = None) -> tuple[str, InlineKeyboar
 
 
 def get_log_text() -> str:
-    """Возвращает хвост файла dev_log.md."""
+    """Возвращает хвост файла dev_log.md (с маскированием секретов)."""
     if not DEV_LOG_PATH.exists():
         return "Файл <code>dev_log.md</code> пока не найден."
-    content = DEV_LOG_PATH.read_text(encoding="utf-8")
+    content = sanitize_log_text(DEV_LOG_PATH.read_text(encoding="utf-8"))
     tail = content[-1500:] if len(content) > 1500 else content
     return f"📖 <b>Последние записи из dev_log.md:</b>\n\n<pre>{tail}</pre>"
 
@@ -1472,27 +1614,29 @@ def get_log_keyboard() -> InlineKeyboardMarkup:
 def get_setup_summary_text() -> str:
     cfg = load_bot_config()
     pat = cfg.get("github_pat", "")
-    masked_pat = f"{pat[:12]}...{pat[-4:]}" if len(pat) > 16 else ("Задан" if pat else "❌ Не задан")
+    masked_pat = f"{pat[:6]}...{pat[-4:]}" if len(pat) > 12 else ("Задан" if pat else "❌ Не задан")
     ks = "✅ Загружен" if cfg.get("keystore_base64") else "➖ Не задан (опционально)"
-    known_repos, init_flag = load_known_repos()
+    known_repos, _ = load_known_repos()
     return (
-        f"⚙️ <b>Настройки бота и автосборки (bot_config.json)</b>\n\n"
-        f"• <b>GitHub профиль:</b> <code>{cfg.get('github_owner')}</code>\n"
-        f"• <b>Активный проект:</b> <code>{cfg.get('github_repo')}</code>\n"
+        f"⚙️ <b>Настройки бота и автосборки</b>\n\n"
+        f"• <b>GitHub профиль:</b> <code>{cfg.get('github_owner') or 'не задан'}</code>\n"
+        f"• <b>Активный проект:</b> <code>{cfg.get('github_repo') or 'не выбран'}</code>\n"
         f"• <b>GitHub Token (PAT):</b> <code>{masked_pat}</code>\n"
         f"• <b>Keystore (.jks Base64):</b> {ks}\n"
         f"• <b>Key Alias:</b> <code>{cfg.get('key_alias') or 'не задан'}</code>\n"
         f"• <b>Отслеживаемых репозиториев:</b> <code>{len(known_repos)}</code> (проверка каждые 3 мин)\n\n"
-        f"Чтобы задать или обновить токен в 1 клик без консоли — нажмите кнопку ниже или отправьте <code>/token ВАШ_ТОКЕН</code>:"
+        f"Чтобы задать или обновить токен в 1 клик — нажмите кнопку ниже или отправьте <code>/token ВАШ_ТОКЕН</code>:"
     )
 
 
 # =====================================================================
 # 6. ОБРАБОТЧИКИ КОМАНД, КНОПОК И ИНТЕРАКТИВНОГО ВВОДА СЕКРЕТОВ
+#    (Все хэндлеры защищены глобальным AdminOnlyMiddleware + @admin_only)
 # =====================================================================
 
 @router.message(Command("start"))
 @router.channel_post(Command("start"))
+@admin_only
 async def cmd_start(message: Message):
     chat_id = message.chat.id
     PENDING_INPUT_STATE.pop(chat_id, None)
@@ -1510,10 +1654,9 @@ async def cmd_start(message: Message):
 @router.message(Command("repos"))
 @router.channel_post(Command("repos"))
 @router.message(F.text == "📂 Мои репозитории")
+@admin_only
 async def cmd_repos_list(message: Message):
     """Открывает интерактивный список ВСЕХ репозиториев пользователя."""
-    if not is_authorized(message.chat.id):
-        return
     PENDING_INPUT_STATE.pop(message.chat.id, None)
     text, kb = await get_all_tracked_repos_view()
     await message.answer(text, reply_markup=kb)
@@ -1522,9 +1665,8 @@ async def cmd_repos_list(message: Message):
 @router.message(Command("setup"))
 @router.channel_post(Command("setup"))
 @router.message(F.text == "⚙️ Настройки / Токен")
+@admin_only
 async def cmd_setup(message: Message):
-    if not is_authorized(message.chat.id):
-        return
     PENDING_INPUT_STATE.pop(message.chat.id, None)
     await message.answer(
         get_setup_summary_text(),
@@ -1534,14 +1676,13 @@ async def cmd_setup(message: Message):
 
 @router.message(Command("token"))
 @router.channel_post(Command("token"))
+@admin_only
 async def cmd_token(message: Message, command: CommandObject):
-    if not is_authorized(message.chat.id):
-        return
     if command.args and command.args.strip():
         token_val = command.args.strip()
         save_bot_config({"github_pat": token_val})
         await message.answer(
-            "✅ <b>GitHub Personal Access Token сохранен в <code>bot_config.json</code>!</b>\n"
+            "✅ <b>GitHub Personal Access Token сохранен!</b>\n"
             "Теперь бот будет использовать его автоматически для всех операций с GitHub API.",
             reply_markup=get_setup_inline_keyboard()
         )
@@ -1552,14 +1693,14 @@ async def cmd_token(message: Message, command: CommandObject):
 @router.message(Command("check_repos"))
 @router.channel_post(Command("check_repos"))
 @router.message(F.text == "🔍 Проверить репозитории")
+@admin_only
 async def cmd_check_repos(message: Message):
-    if not is_authorized(message.chat.id):
-        return
     await check_for_new_repositories(manual_trigger_chat_id=message.chat.id)
 
 
 @router.message(Command("build"))
 @router.channel_post(Command("build"))
+@admin_only
 async def cmd_build(message: Message, command: CommandObject):
     cfg = load_bot_config()
     args = (command.args or "").split(maxsplit=1)
@@ -1576,6 +1717,7 @@ async def cmd_build(message: Message, command: CommandObject):
 
 
 @router.message(F.text == "🚀 Собрать APK (main)")
+@admin_only
 async def reply_btn_build(message: Message):
     cfg = load_bot_config()
     sender_label = f"@{message.from_user.username}" if message.from_user and message.from_user.username else str(message.chat.id)
@@ -1585,20 +1727,16 @@ async def reply_btn_build(message: Message):
 @router.message(Command("status"))
 @router.channel_post(Command("status"))
 @router.message(F.text == "📊 Статус CI/CD")
+@admin_only
 async def cmd_status(message: Message):
-    if not is_authorized(message.chat.id):
-        await message.answer("⛔ Доступ запрещен.")
-        return
     text, kb = await get_status_text()
     await message.answer(text, reply_markup=kb)
 
 
 @router.message(Command("log"))
 @router.channel_post(Command("log"))
+@admin_only
 async def cmd_log(message: Message, command: CommandObject):
-    if not is_authorized(message.chat.id):
-        return
-
     if command.args:
         append_to_dev_log(command.args.strip())
         await message.answer(
@@ -1611,22 +1749,22 @@ async def cmd_log(message: Message, command: CommandObject):
 
 
 @router.message(F.text == "📖 Журнал сборок (log)")
+@admin_only
 async def reply_btn_log(message: Message):
-    if not is_authorized(message.chat.id):
-        return
     await message.answer(get_log_text(), reply_markup=get_log_keyboard())
 
 
 @router.message(F.text == "ℹ️ О репозитории")
+@admin_only
 async def reply_btn_info(message: Message):
     chat_id = message.chat.id
     cfg = load_bot_config()
     known_repos, _ = load_known_repos()
-    auth_status = "Доступ разрешен" if is_authorized(chat_id) else "Нет в списке разрешенных"
+    auth_status = "Доступ разрешен (Admin)" if is_authorized(chat_id) else "Нет в списке разрешенных"
     await message.answer(
         f"ℹ️ <b>Информация о сборке и мониторинге:</b>\n\n"
-        f"• <b>Профиль:</b> <code>{cfg.get('github_owner')}</code>\n"
-        f"• <b>Активный репозиторий:</b> <code>{cfg.get('github_repo')}</code>\n"
+        f"• <b>Профиль:</b> <code>{cfg.get('github_owner') or 'не задан'}</code>\n"
+        f"• <b>Активный репозиторий:</b> <code>{cfg.get('github_repo') or 'не выбран'}</code>\n"
         f"• <b>Файл воркфлоу:</b> <code>{cfg.get('github_workflow')}</code>\n"
         f"• <b>Ветка:</b> <code>{cfg.get('github_branch')}</code>\n"
         f"• <b>Известных репозиториев в базе:</b> <code>{len(known_repos)}</code>\n"
@@ -1640,6 +1778,7 @@ async def reply_btn_info(message: Message):
 # ---------------------------------------------------------------------
 
 @router.callback_query(F.data == "cb_back_main")
+@admin_only
 async def callback_back_main(call: CallbackQuery):
     """Возвращает пользователя в главное меню и отменяет незавершенный ввод."""
     await call.answer("Главное меню")
@@ -1654,6 +1793,7 @@ async def callback_back_main(call: CallbackQuery):
 
 
 @router.callback_query(F.data == "cb_repos_list")
+@admin_only
 async def callback_repos_list(call: CallbackQuery):
     """Показывает интерактивный список ВСЕХ репозиториев пользователя."""
     await call.answer("Загружаю список репозиториев...")
@@ -1667,6 +1807,7 @@ async def callback_repos_list(call: CallbackQuery):
 
 
 @router.callback_query(F.data == "cb_back_setup")
+@admin_only
 async def callback_back_setup(call: CallbackQuery):
     """Возвращает пользователя из режима ввода поля обратно в меню настроек."""
     await call.answer("Назад к настройкам")
@@ -1681,6 +1822,7 @@ async def callback_back_setup(call: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("repo_card:"))
+@admin_only
 async def callback_open_repo_card(call: CallbackQuery):
     """Открывает карточку управления выбранным репозиторием."""
     repo_name = call.data.split(":", 1)[1]
@@ -1688,8 +1830,8 @@ async def callback_open_repo_card(call: CallbackQuery):
     chat_id = call.message.chat.id
     PENDING_INPUT_STATE.pop(chat_id, None)
     cfg = load_bot_config()
-    owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
-    active_repo = cfg.get("github_repo", "xianxia-sect-maneger")
+    owner = cfg.get("github_owner", "")
+    active_repo = cfg.get("github_repo", "")
     status_badge = "⭐ Основной проект бота" if repo_name == active_repo else "📦 Подключенный репозиторий"
 
     card_text = (
@@ -1707,16 +1849,17 @@ async def callback_open_repo_card(call: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("repo_set_active:"))
+@admin_only
 async def callback_repo_set_active(call: CallbackQuery):
     """Делает выбранный репозиторий основным по умолчанию для бота."""
     repo_name = call.data.split(":", 1)[1]
     save_bot_config({"github_repo": repo_name})
     await call.answer(f"Проект {repo_name} теперь основной!", show_alert=True)
     cfg = load_bot_config()
-    owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
+    owner = cfg.get("github_owner", "")
     card_text = (
         f"🛠 <b>Управление репозиторием: <code>{owner}/{repo_name}</code></b>\n\n"
-        f"• <b>Статус:</b> ⭐ Основной проект бота (сохранено в <code>bot_config.json</code>)\n"
+        f"• <b>Статус:</b> ⭐ Основной проект бота\n"
         f"• <b>Ссылка:</b> <a href=\"https://github.com/{owner}/{repo_name}\">github.com/{owner}/{repo_name}</a>\n\n"
         f"Выберите действие для этого репозитория:"
     )
@@ -1728,6 +1871,7 @@ async def callback_repo_set_active(call: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("repo_build_now:"))
+@admin_only
 async def callback_repo_build_now(call: CallbackQuery):
     """Запускает сборку APK в конкретном выбранном репозитории."""
     repo_name = call.data.split(":", 1)[1]
@@ -1745,6 +1889,7 @@ async def callback_repo_build_now(call: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("repo_status:"))
+@admin_only
 async def callback_repo_status(call: CallbackQuery):
     """Проверяет статус сборок для конкретного выбранного репозитория."""
     repo_name = call.data.split(":", 1)[1]
@@ -1757,6 +1902,7 @@ async def callback_repo_status(call: CallbackQuery):
 
 
 @router.callback_query(F.data == "cb_build")
+@admin_only
 async def callback_build(call: CallbackQuery):
     await call.answer()
     cfg = load_bot_config()
@@ -1765,6 +1911,7 @@ async def callback_build(call: CallbackQuery):
 
 
 @router.callback_query(F.data == "cb_status")
+@admin_only
 async def callback_status(call: CallbackQuery):
     await call.answer("Запрашиваю статус...")
     text, kb = await get_status_text()
@@ -1775,6 +1922,7 @@ async def callback_status(call: CallbackQuery):
 
 
 @router.callback_query(F.data == "cb_log")
+@admin_only
 async def callback_log(call: CallbackQuery):
     await call.answer("Открываю журнал...")
     text = get_log_text()
@@ -1786,12 +1934,14 @@ async def callback_log(call: CallbackQuery):
 
 
 @router.callback_query(F.data == "cb_check_repos")
+@admin_only
 async def callback_check_repos(call: CallbackQuery):
     await call.answer("Проверяю GitHub профиль...")
     await check_for_new_repositories(manual_trigger_chat_id=call.message.chat.id)
 
 
 @router.callback_query(F.data == "cb_setup_menu")
+@admin_only
 async def callback_setup_menu(call: CallbackQuery):
     await call.answer()
     PENDING_INPUT_STATE.pop(call.message.chat.id, None)
@@ -1804,12 +1954,13 @@ async def callback_setup_menu(call: CallbackQuery):
 
 
 @router.callback_query(F.data == "cb_simulate_new_repo")
+@admin_only
 async def callback_simulate_new_repo(call: CallbackQuery):
     """Позволяет протестировать карточку нового репозитория на текущем проекте."""
     await call.answer()
     cfg = load_bot_config()
-    owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
-    repo = cfg.get("github_repo", "xianxia-sect-maneger")
+    owner = cfg.get("github_owner", "")
+    repo = cfg.get("github_repo", "")
     card_text = (
         f"🆕 <b>Обнаружен новый репозиторий на GitHub!</b>\n\n"
         f"• <b>Проект:</b> <a href=\"https://github.com/{owner}/{repo}\">{owner}/{repo}</a>\n"
@@ -1832,6 +1983,7 @@ async def callback_simulate_new_repo(call: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("setup_field:"))
+@admin_only
 async def callback_setup_field(call: CallbackQuery):
     await call.answer()
     field = call.data.split(":", 1)[1]
@@ -1841,7 +1993,7 @@ async def callback_setup_field(call: CallbackQuery):
     prompts = {
         "github_pat": (
             "🔑 Отправьте ваш <b>GitHub Personal Access Token</b> (<code>github_pat_...</code> или <code>ghp_...</code>) "
-            "ответным сообщением. Бот сохранит его в <code>bot_config.json</code>:"
+            "ответным сообщением:"
         ),
         "keystore_base64": (
             "🔐 Отправьте Base64-строку вашего <code>.jks</code> ключа (или просто перешлите файл <code>.jks</code> "
@@ -1853,7 +2005,7 @@ async def callback_setup_field(call: CallbackQuery):
             "<code>STORE_PASSWORD KEY_ALIAS KEY_PASSWORD</code>"
         ),
         "github_owner": (
-            "👤 Отправьте ваш логин на GitHub (например, <code>retrihgtrtyuh-cmd</code>):"
+            "👤 Отправьте ваш логин на GitHub (<code>GITHUB_OWNER</code>):"
         ),
     }
     prompt_text = prompts.get(field, "Отправьте новое значение:")
@@ -1869,12 +2021,13 @@ async def callback_setup_field(call: CallbackQuery):
 # ---------------------------------------------------------------------
 
 @router.callback_query(F.data.startswith("repo_update_wf:"))
+@admin_only
 async def callback_repo_update_wf(call: CallbackQuery):
-    """Перезаписывает .github/workflows/build-and-deploy.yml в выбранном репозитории (например, Planer-lesson)."""
+    """Перезаписывает .github/workflows/build-and-deploy.yml и GitHub Secrets в выбранном репозитории."""
     repo_name = call.data.split(":", 1)[1]
     chat_id = call.message.chat.id
     cfg = load_bot_config()
-    owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
+    owner = cfg.get("github_owner", "")
     token = cfg.get("github_pat", "")
 
     if not token:
@@ -1886,7 +2039,7 @@ async def callback_repo_update_wf(call: CallbackQuery):
     wait_msg = await call.message.answer(
         f"🔄 <b>Перезаписываю workflow в <code>{owner}/{repo_name}</code>...</b>\n"
         f"• Установка <code>actions/setup-java@v5</code> (без <code>cache: 'gradle'</code>)\n"
-        f"• Авто-обертка веб-проектов AI Studio через Capacitor (<code>npx cap add android</code>)\n"
+        f"• Авто-обертка веб-проектов через Capacitor (<code>npx cap add android</code>)\n"
         f"• Переименование APK в <code>{repo_name}_v{{run_number}}.apk</code>"
     )
 
@@ -1896,7 +2049,7 @@ async def callback_repo_update_wf(call: CallbackQuery):
         await wait_msg.edit_text(
             f"✅ <b>Workflow в репозитории <code>{owner}/{repo_name}</code> успешно обновлен!</b>\n\n"
             f"• <b>Файл:</b> <code>.github/workflows/build-and-deploy.yml</code>\n"
-            f"• <b>Исправления:</b> <code>setup-java@v5</code> без кэша Gradle + Capacitor Android-обертка для веб-приложений + переименование <code>{repo_name}_v{{run_number}}.apk</code>\n"
+            f"• <b>Исправления:</b> <code>setup-java@v5</code> без кэша Gradle + Capacitor Android-обертка + переименование <code>{repo_name}_v{{run_number}}.apk</code>\n"
             f"• <b>Секреты:</b> {details}\n\n"
             f"Нажмите кнопку ниже, чтобы сразу запустить новую сборку APK:",
             reply_markup=res_kb
@@ -1909,11 +2062,12 @@ async def callback_repo_update_wf(call: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("repo_apk:"))
+@admin_only
 async def callback_repo_apk(call: CallbackQuery):
     repo_name = call.data.split(":", 1)[1]
     chat_id = call.message.chat.id
     cfg = load_bot_config()
-    owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
+    owner = cfg.get("github_owner", "")
 
     if not cfg.get("github_pat"):
         await call.answer("Нужен GitHub токен!", show_alert=True)
@@ -1946,11 +2100,12 @@ async def callback_repo_apk(call: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("repo_pages:"))
+@admin_only
 async def callback_repo_pages(call: CallbackQuery):
     repo_name = call.data.split(":", 1)[1]
     chat_id = call.message.chat.id
     cfg = load_bot_config()
-    owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
+    owner = cfg.get("github_owner", "")
 
     if not cfg.get("github_pat"):
         await call.answer("Нужен GitHub токен!", show_alert=True)
@@ -1974,6 +2129,7 @@ async def callback_repo_pages(call: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("repo_skip:"))
+@admin_only
 async def callback_repo_skip(call: CallbackQuery):
     repo_name = call.data.split(":", 1)[1]
     await call.answer("Репозиторий пропущен")
@@ -1992,8 +2148,9 @@ async def callback_repo_skip(call: CallbackQuery):
 # ---------------------------------------------------------------------
 
 @router.message(F.document)
+@admin_only
 async def handle_uploaded_keystore_file(message: Message):
-    """Если пользователь прислал файл .jks/.keystore во время настройки — кодируем в Base64 автоматически."""
+    """Если администратор прислал файл .jks/.keystore во время настройки — кодируем в Base64 автоматически."""
     state = PENDING_INPUT_STATE.get(message.chat.id)
     if not state or state.get("field") != "keystore_base64":
         return
@@ -2007,14 +2164,15 @@ async def handle_uploaded_keystore_file(message: Message):
     save_bot_config({"keystore_base64": b64_str})
     PENDING_INPUT_STATE.pop(message.chat.id, None)
     await message.answer(
-        f"✅ Файл <code>{doc.file_name}</code> автоматически закодирован в Base64 и сохранен в <code>bot_config.json</code>!",
+        f"✅ Файл <code>{doc.file_name}</code> автоматически закодирован в Base64 и сохранен!",
         reply_markup=get_setup_inline_keyboard()
     )
 
 
 @router.message(F.text & ~F.text.startswith("/"))
+@admin_only
 async def handle_interactive_input(message: Message):
-    """Принимает токен или секрет, отправленный пользователем в чат один раз, и продолжает отложенное действие."""
+    """Принимает токен или секрет от администратора и продолжает отложенное действие."""
     chat_id = message.chat.id
     state = PENDING_INPUT_STATE.get(chat_id)
     if not state:
@@ -2028,13 +2186,13 @@ async def handle_interactive_input(message: Message):
     if field == "github_pat":
         save_bot_config({"github_pat": val})
         await message.answer(
-            "✅ <b>GitHub Token (PAT) сохранен в <code>bot_config.json</code>!</b>",
+            "✅ <b>GitHub Token (PAT) сохранен!</b>",
             reply_markup=get_setup_inline_keyboard() if not pending_action else None
         )
     elif field == "keystore_base64":
         save_bot_config({"keystore_base64": val})
         await message.answer(
-            "✅ <b>Keystore Base64 сохранен в <code>bot_config.json</code>!</b>",
+            "✅ <b>Keystore Base64 сохранен!</b>",
             reply_markup=get_setup_inline_keyboard()
         )
     elif field == "keystore_creds":
@@ -2046,7 +2204,7 @@ async def handle_interactive_input(message: Message):
                 "key_password": parts[2]
             })
             await message.answer(
-                "✅ <b>Пароли и Alias ключа сохранены в <code>bot_config.json</code>!</b>",
+                "✅ <b>Пароли и Alias ключа сохранены!</b>",
                 reply_markup=get_setup_inline_keyboard()
             )
         else:
@@ -2064,9 +2222,8 @@ async def handle_interactive_input(message: Message):
 
     PENDING_INPUT_STATE.pop(chat_id, None)
 
-    # Если ввод токена был запрошен во время нажатия кнопки на карточке нового репозитория — сразу продолжаем!
     cfg = load_bot_config()
-    owner = cfg.get("github_owner", "retrihgtrtyuh-cmd")
+    owner = cfg.get("github_owner", "")
     if pending_action in ("apk", "update_wf") and repo_name:
         res_kb = get_repo_action_result_keyboard(repo_name)
         wait_msg = await message.answer(f"⏳ Обновляю workflow и секреты автосборки APK для <code>{owner}/{repo_name}</code>...")
@@ -2105,36 +2262,31 @@ async def handle_interactive_input(message: Message):
 # =====================================================================
 
 async def handle_root(request: web.Request) -> web.Response:
-    """Корневой маршрут GET / для Render (отвечает 200 OK 'Bot is alive')."""
+    """Корневой маршрут GET / для Hugging Face Spaces / Render (отвечает 200 OK без утечки метаданных)."""
     return web.Response(text="Bot is alive", status=200, content_type="text/plain")
 
 
 async def handle_health(request: web.Request) -> web.Response:
-    """Проверка здоровья GET /health."""
-    cfg = load_bot_config()
-    known, _ = load_known_repos()
+    """Проверка здоровья GET /health — НЕ раскрывает имена репозиториев или логин владельца."""
     return web.json_response({
         "status": "ok",
-        "bot": "alive",
-        "target_repo": f"{cfg.get('github_owner')}/{cfg.get('github_repo')}",
-        "workflow": cfg.get("github_workflow"),
-        "known_repos_count": len(known)
+        "bot": "alive"
     })
 
 
 async def handle_upload_apk(request: web.Request) -> web.Response:
-    """Прием собранного APK от GitHub Actions и рассылка в чаты/канал."""
+    """Прием собранного APK от GitHub Actions (требует обязательный заголовок X-Webhook-Secret)."""
     cfg = load_bot_config()
     webhook_secret = cfg.get("webhook_secret", "")
     secret_header = request.headers.get("X-Webhook-Secret", "")
-    if webhook_secret and not hmac.compare_digest(secret_header, webhook_secret):
+    if not webhook_secret or not hmac.compare_digest(secret_header, webhook_secret):
         return web.json_response({"error": "Forbidden"}, status=403)
 
     reader = await request.multipart()
     apk_bytes = None
     apk_filename = ""
     meta = {
-        "repo_name": cfg.get("github_repo", "xianxia-sect-maneger"),
+        "repo_name": cfg.get("github_repo", "project"),
         "commit_sha": "unknown",
         "commit_msg": "Без описания",
         "author": "unknown",
@@ -2153,7 +2305,7 @@ async def handle_upload_apk(request: web.Request) -> web.Response:
         return web.json_response({"error": "apk_file missing"}, status=400)
 
     short_sha = meta["commit_sha"][:7]
-    repo_name = meta["repo_name"] or cfg.get("github_repo", "xianxia-sect-maneger")
+    repo_name = meta["repo_name"] or cfg.get("github_repo", "project")
     build_num = meta["build_number"]
     if not apk_filename or apk_filename == "app-release.apk":
         apk_filename = f"{repo_name}_v{build_num}.apk"
@@ -2173,7 +2325,7 @@ async def handle_upload_apk(request: web.Request) -> web.Response:
             doc = BufferedInputFile(apk_bytes, filename=apk_filename)
             await bot.send_document(chat_id=chat_id, document=doc, caption=caption)
         except Exception as exc:
-            logger.error(f"Ошибка отправки APK в {chat_id}: {exc}")
+            logger.error(f"Ошибка отправки APK в авторизованный чат: {exc}")
 
     return web.json_response({"ok": True})
 
@@ -2188,17 +2340,15 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
     await site.start()
-    logger.info(f"Веб-сервер запущен на порту {PORT} (GET /, GET /health, POST /api/upload-apk)")
+    logger.info(f"Веб-сервер запущен на порту {PORT}")
 
-    # Запускаем фоновую задачу отслеживания новых репозиториев каждые 3 минуты
     watcher_task = asyncio.create_task(background_repo_watcher())
 
     try:
         logger.info("Сброс активного вебхука...")
         await bot.delete_webhook(drop_pending_updates=True)
 
-        cfg = load_bot_config()
-        logger.info(f"Запуск Long Polling (профиль: {cfg.get('github_owner')})...")
+        logger.info("Запуск Long Polling (изоляция доступа ADMIN_ID активна)...")
         await dp.start_polling(
             bot,
             allowed_updates=["message", "channel_post", "callback_query"]

@@ -8,5 +8,16 @@ coverage/
 !.env.example
 bot_config.json
 known_repos.json
+dev_log.md
+*.jks
+*.keystore
+*.pem
+*.key
+*.apk
+*.aab
+*.db
+*.sqlite
+*.sqlite3
+*.session
 __pycache__/
 *.pyc
