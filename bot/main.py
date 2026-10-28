@@ -69,7 +69,15 @@ def load_bot_config() -> dict:
     Собирает все существующие токены, Chat ID, GitHub логин и данные подписи APK
     из переменных окружения и дополняет их сохраненными данными из bot_config.json.
     """
-    default_chat_id = os.getenv("TELEGRAM_CHAT_ID", "-1003962969725")
+    raw_env_ids = [
+        x.strip() for x in os.getenv("TELEGRAM_CHAT_IDS", "").split(",")
+        if x.strip().lstrip("-").isdigit()
+    ]
+    default_chat_id = (
+        os.getenv("TELEGRAM_CHAT_ID")
+        or os.getenv("CHAT_ID")
+        or (raw_env_ids[0] if raw_env_ids else "")
+    )
     base_cfg = {
         "github_pat": os.getenv("GITHUB_PAT", ""),
         "github_owner": os.getenv("GITHUB_OWNER", "retrihgtrtyuh-cmd"),
@@ -181,16 +189,17 @@ def append_to_dev_log(entry: str) -> None:
 # 2. ШАБЛОН WORKFLOW (.github/workflows/build-and-deploy.yml) ДЛЯ НОВЫХ РЕПОЗИТОРИЕВ
 # =====================================================================
 
-def generate_workflow_yaml() -> str:
+def generate_workflow_yaml(default_chat_id: str = "") -> str:
     """
     Генерирует универсальный файл .github/workflows/build-and-deploy.yml для любых проектов из AI Studio.
     1) В Set up JDK 17 использует actions/setup-java@v5 БЕЗ cache: 'gradle'.
     2) Если папки android и файла gradlew нет — устанавливает Node.js, собирает веб-бандл (npm install && npm run build
        или корневой index.html), создает capacitor.config.json с именем репозитория, выполняет npx cap add android,
-       переходит в папку android и собирает APK через ./gradlew assembleRelease.
-    3) Переименовывает готовый APK в формат {имя_репозитория}_v{github.run_number}.apk перед отправкой в Telegram.
+       переходит в папку android и собирает APK через ./gradlew assembleRelease -x lint.
+    3) Переименовывает готовый APK в формат {имя_репозитория}_v{github.run_number}.apk и отправляет в Telegram,
+       используя секреты TELEGRAM_BOT_TOKEN (или BOT_TOKEN) и TELEGRAM_CHAT_ID (или CHAT_ID).
     """
-    return """name: Build & Deploy Android APK to Telegram
+    yaml_template = """name: Build & Deploy Android APK to Telegram
 
 on:
   push:
@@ -362,7 +371,9 @@ jobs:
         if: success()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
           REPO_NAME: ${{ github.event.repository.name }}
           RUN_NUM: ${{ github.run_number }}
           APK_PATH: ${{ steps.locate_apk.outputs.apk_path }}
@@ -370,21 +381,53 @@ jobs:
           COMMIT_MSG: ${{ steps.locate_apk.outputs.commit_msg }}
           AUTHOR: ${{ steps.locate_apk.outputs.author }}
         run: |
+          TOKEN="${TELEGRAM_BOT_TOKEN:-$BOT_TOKEN}"
+          TARGET_CHAT_ID="${TELEGRAM_CHAT_ID:-$CHAT_ID}"
+          FALLBACK_CHAT_ID="__FALLBACK_CHAT_ID__"
+          if [ -z "$TARGET_CHAT_ID" ] && [ -n "$FALLBACK_CHAT_ID" ]; then
+            TARGET_CHAT_ID="$FALLBACK_CHAT_ID"
+          fi
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Секрет TELEGRAM_BOT_TOKEN (или BOT_TOKEN) не найден в GitHub Actions Secrets!"
+            exit 1
+          fi
+          if [ -z "$TARGET_CHAT_ID" ]; then
+            echo "::error::Секрет TELEGRAM_CHAT_ID (или CHAT_ID) не найден в GitHub Actions Secrets!"
+            exit 1
+          fi
           RENAMED_APK="${REPO_NAME}_v${RUN_NUM}.apk"
           if [ "$APK_PATH" != "./$RENAMED_APK" ] && [ -f "$APK_PATH" ]; then
             cp "$APK_PATH" "./$RENAMED_APK"
           fi
           CAPTION="📦 <b>Сборка APK готова!</b>%0A%0A• <b>Проект:</b> <code>${REPO_NAME}</code>%0A• <b>Номер сборки:</b> <code>#${RUN_NUM}</code> (<code>v${RUN_NUM}</code>)%0A• <b>Файл:</b> <code>${RENAMED_APK}</code>%0A• <b>Ветка:</b> <code>${{ github.ref_name }}</code>%0A• <b>Коммит:</b> <code>${SHORT_SHA}</code> — ${COMMIT_MSG}%0A• <b>Автор:</b> ${AUTHOR}"
-          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \\
-            -F "chat_id=${TELEGRAM_CHAT_ID}" \\
+          RESPONSE=$(curl -sS -w "\\n%{http_code}" -X POST "https://api.telegram.org/bot${TOKEN}/sendDocument" \\
+            -F "chat_id=${TARGET_CHAT_ID}" \\
             -F "parse_mode=HTML" \\
             -F "caption=${CAPTION}" \\
-            -F "document=@./${RENAMED_APK}"
+            -F "document=@./${RENAMED_APK}")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          echo "Telegram API HTTP status: $HTTP_CODE"
+          if [ "$HTTP_CODE" -ne 200 ] && [ -n "$FALLBACK_CHAT_ID" ] && [ "$FALLBACK_CHAT_ID" != "$TARGET_CHAT_ID" ]; then
+            echo "Повторная отправка в активный чат $FALLBACK_CHAT_ID..."
+            RESPONSE=$(curl -sS -w "\\n%{http_code}" -X POST "https://api.telegram.org/bot${TOKEN}/sendDocument" \\
+              -F "chat_id=${FALLBACK_CHAT_ID}" \\
+              -F "parse_mode=HTML" \\
+              -F "caption=${CAPTION}" \\
+              -F "document=@./${RENAMED_APK}")
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+            BODY=$(echo "$RESPONSE" | sed '$d')
+          fi
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "::error::Не удалось отправить APK в Telegram (chat_id=${TARGET_CHAT_ID}). Ответ: $BODY"
+            exit 1
+          fi
 
       - name: Cleanup Keystore & Temp APK
         if: always()
         run: rm -f "$RUNNER_TEMP/release-key.jks" app/release-key.jks ./*_v*.apk
 """
+    return yaml_template.replace("__FALLBACK_CHAT_ID__", str(default_chat_id or "").strip())
 
 
 # =====================================================================
@@ -416,24 +459,27 @@ async def set_repo_actions_secret(
     repo: str,
     token: str,
     secret_name: str,
-    secret_value: str
+    secret_value: str,
+    cached_pk: dict = None
 ) -> tuple[bool, str]:
-    """Записывает секрет в GitHub Actions Secrets указанного репозитория."""
+    """Записывает секрет в GitHub Actions Secrets (/repos/{owner}/{repo}/actions/secrets/{secret_name})."""
     if not HAS_NACL:
         return False, "Библиотека PyNaCl не установлена (нужна для шифрования GitHub Secrets)."
 
     headers = get_github_headers(token)
-    pk_url = f"https://api.github.com/repos/{owner}/{repo}/actions/secrets/public-key"
-
-    async with session.get(pk_url, headers=headers) as resp:
-        if resp.status != 200:
-            err = await resp.text()
-            return False, f"Не удалось получить public-key репозитория (HTTP {resp.status}): {err}"
-        pk_data = await resp.json()
+    if cached_pk and "key_id" in cached_pk and "key" in cached_pk:
+        pk_data = cached_pk
+    else:
+        pk_url = f"https://api.github.com/repos/{owner}/{repo}/actions/secrets/public-key"
+        async with session.get(pk_url, headers=headers) as resp:
+            if resp.status != 200:
+                err = await resp.text()
+                return False, f"Не удалось получить public-key репозитория (HTTP {resp.status}): {err}"
+            pk_data = await resp.json()
 
     key_id = pk_data["key_id"]
     key_b64 = pk_data["key"]
-    encrypted_value = encrypt_github_secret(key_b64, secret_value)
+    encrypted_value = encrypt_github_secret(key_b64, str(secret_value))
 
     secret_url = f"https://api.github.com/repos/{owner}/{repo}/actions/secrets/{secret_name}"
     payload = {
@@ -452,7 +498,8 @@ async def create_or_update_workflow_file(
     owner: str,
     repo: str,
     token: str,
-    branch: str = "main"
+    branch: str = "main",
+    default_chat_id: str = ""
 ) -> tuple[bool, str]:
     """Создает или обновляет .github/workflows/build-and-deploy.yml в репозитории."""
     headers = get_github_headers(token)
@@ -466,7 +513,7 @@ async def create_or_update_workflow_file(
             data = await resp.json()
             existing_sha = data.get("sha")
 
-    yaml_content = generate_workflow_yaml()
+    yaml_content = generate_workflow_yaml(default_chat_id=default_chat_id)
     content_b64 = base64.b64encode(yaml_content.encode("utf-8")).decode("utf-8")
 
     payload = {
@@ -486,18 +533,34 @@ async def create_or_update_workflow_file(
 async def setup_auto_apk_for_repo(owner: str, repo: str, chat_id: int) -> tuple[bool, str]:
     """
     Полный цикл настройки автосборки APK в новом репозитории:
-    1. Записывает секреты (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID и опционально KEYSTORE_*).
-    2. Создает файл .github/workflows/build-and-deploy.yml.
+    1. Автоматически создает GitHub Actions Secrets через /repos/{owner}/{repo}/actions/secrets/{secret_name}:
+       - TELEGRAM_BOT_TOKEN и BOT_TOKEN
+       - TELEGRAM_CHAT_ID и CHAT_ID
+       - (опционально) KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD
+    2. Создает или обновляет файл .github/workflows/build-and-deploy.yml.
     """
     cfg = load_bot_config()
     token = cfg.get("github_pat", "")
     if not token:
         return False, "MISSING_GITHUB_PAT"
 
-    target_chat_id = str(cfg.get("telegram_chat_id") or chat_id)
+    # Используем текущий chat_id (из которого нажата кнопка в боте), либо явно заданный пользователем telegram_chat_id
+    configured_chat_id = str(cfg.get("telegram_chat_id") or "").strip()
+    if chat_id and (not configured_chat_id or configured_chat_id == "-1003962969725"):
+        target_chat_id = str(chat_id)
+        save_bot_config({"telegram_chat_id": target_chat_id})
+    else:
+        target_chat_id = configured_chat_id or str(chat_id)
+
+    if chat_id:
+        AUTHORIZED_CHAT_IDS.add(int(chat_id))
+
+    bot_token_val = (TELEGRAM_BOT_TOKEN or os.getenv("BOT_TOKEN") or "").strip()
     secrets_to_set = {
-        "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
+        "TELEGRAM_BOT_TOKEN": bot_token_val,
+        "BOT_TOKEN": bot_token_val,
         "TELEGRAM_CHAT_ID": target_chat_id,
+        "CHAT_ID": target_chat_id,
     }
 
     # Если у нас сохранены данные подписи APK (keystore), прописываем и их
@@ -511,20 +574,37 @@ async def setup_auto_apk_for_repo(owner: str, repo: str, chat_id: int) -> tuple[
         if val and val != "-":
             secrets_to_set[secret_env_name] = val
 
+    headers = get_github_headers(token)
     async with aiohttp.ClientSession() as session:
-        # 1. Прописываем секреты в Actions Secrets
+        # Получаем public-key репозитория один раз для шифрования всех секретов
+        pk_url = f"https://api.github.com/repos/{owner}/{repo}/actions/secrets/public-key"
+        cached_pk = None
+        async with session.get(pk_url, headers=headers) as pk_resp:
+            if pk_resp.status == 200:
+                cached_pk = await pk_resp.json()
+
+        # 1. Прописываем секреты в Actions Secrets (/repos/{owner}/{repo}/actions/secrets/{secret_name})
         for s_name, s_val in secrets_to_set.items():
-            ok, msg = await set_repo_actions_secret(session, owner, repo, token, s_name, s_val)
+            if not s_val:
+                continue
+            ok, msg = await set_repo_actions_secret(
+                session, owner, repo, token, s_name, s_val, cached_pk=cached_pk
+            )
             if not ok:
                 return False, msg
 
         # 2. Создаем .github/workflows/build-and-deploy.yml
-        ok, msg = await create_or_update_workflow_file(session, owner, repo, token)
+        ok, msg = await create_or_update_workflow_file(
+            session, owner, repo, token, default_chat_id=target_chat_id
+        )
         if not ok:
             return False, msg
 
-    append_to_dev_log(f"В репозитории `{owner}/{repo}` автоматически настроен CI/CD (.github/workflows/build-and-deploy.yml + Actions Secrets).")
-    return True, f"Секретов записано: {len(secrets_to_set)} ({', '.join(secrets_to_set.keys())})"
+    append_to_dev_log(
+        f"В репозитории `{owner}/{repo}` автоматически настроен CI/CD "
+        f"(.github/workflows/build-and-deploy.yml + GitHub Secrets: {', '.join(secrets_to_set.keys())}, chat_id={target_chat_id})."
+    )
+    return True, f"Секретов записано: {len(secrets_to_set)} ({', '.join(secrets_to_set.keys())}; chat_id={target_chat_id})"
 
 
 async def enable_github_pages_for_repo(owner: str, repo: str) -> tuple[bool, str]:

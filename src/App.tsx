@@ -502,7 +502,7 @@ export default function App() {
         {
           id: `wf-upd-${Date.now()}`,
           sender: 'bot',
-          text: `✅ Workflow в репозитории ${r.owner}/${r.repo} успешно обновлен!\n\n• Файл: .github/workflows/build-and-deploy.yml (перезаписан через GitHub API)\n• Шаг JDK 17: actions/setup-java@v5 (удален cache: 'gradle')\n• Авто-обертка AI Studio Web → Android: npm install → npm run build → capacitor.config.json → npx cap add android → cd android → local.properties (sdk.dir=/usr/local/lib/android/sdk) → ./gradlew assembleRelease -x lint\n• Переименование APK: ${r.repo}_v{github.run_number}.apk`,
+          text: `✅ Workflow и секреты в репозитории ${r.owner}/${r.repo} успешно обновлены!\n\n• GitHub Secrets (/repos/${r.owner}/${r.repo}/actions/secrets/*): записаны TELEGRAM_BOT_TOKEN, BOT_TOKEN, TELEGRAM_CHAT_ID (${config.chatId}), CHAT_ID\n• Файл: .github/workflows/build-and-deploy.yml (перезаписан через GitHub API)\n• Шаг JDK 17: actions/setup-java@v5 (удален cache: 'gradle')\n• Авто-обертка AI Studio Web → Android: npm install → npm run build → capacitor.config.json → npx cap add android → cd android → local.properties (sdk.dir=/usr/local/lib/android/sdk) → ./gradlew assembleRelease -x lint\n• Переименование и доставка APK: ${r.repo}_v{github.run_number}.apk → Telegram (${config.chatId})`,
           time: nowTime,
         },
       ],
@@ -909,6 +909,72 @@ def append_to_dev_log(entry: str) -> None:
         logger.warning(f"Ошибка записи в dev_log.md: {exc}")
 
 
+from nacl import encoding, public
+import base64
+
+
+def encrypt_github_secret(public_key_b64: str, secret_value: str) -> str:
+    """Шифрует секрет публичным ключом репозитория (LibSodium / PyNaCl)."""
+    pk = public.PublicKey(public_key_b64.encode("utf-8"), encoding.Base64Encoder())
+    sealed_box = public.SealedBox(pk)
+    encrypted = sealed_box.encrypt(str(secret_value).encode("utf-8"))
+    return base64.b64encode(encrypted).decode("utf-8")
+
+
+async def set_repo_actions_secret(
+    session: aiohttp.ClientSession,
+    owner: str,
+    repo: str,
+    token: str,
+    secret_name: str,
+    secret_value: str,
+    cached_pk: dict = None
+) -> tuple[bool, str]:
+    """Записывает секрет через GitHub API: PUT /repos/{owner}/{repo}/actions/secrets/{secret_name}."""
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "Telegram-APK-Build-Bot/2.0"
+    }
+    if cached_pk and "key_id" in cached_pk and "key" in cached_pk:
+        pk_data = cached_pk
+    else:
+        pk_url = f"https://api.github.com/repos/{owner}/{repo}/actions/secrets/public-key"
+        async with session.get(pk_url, headers=headers) as resp:
+            if resp.status != 200:
+                return False, f"Ошибка получения public-key (HTTP {resp.status})"
+            pk_data = await resp.json()
+
+    encrypted_value = encrypt_github_secret(pk_data["key"], secret_value)
+    secret_url = f"https://api.github.com/repos/{owner}/{repo}/actions/secrets/{secret_name}"
+    payload = {"encrypted_value": encrypted_value, "key_id": pk_data["key_id"]}
+    async with session.put(secret_url, json=payload, headers=headers) as resp:
+        if resp.status in (201, 204):
+            return True, "OK"
+        err = await resp.text()
+        return False, f"HTTP {resp.status}: {err}"
+
+
+async def setup_auto_apk_for_repo(owner: str, repo: str, chat_id: int) -> tuple[bool, str]:
+    """Автоматически записывает TELEGRAM_BOT_TOKEN/BOT_TOKEN и TELEGRAM_CHAT_ID/CHAT_ID в GitHub Secrets и создает build-and-deploy.yml."""
+    if not GITHUB_TOKEN:
+        return False, "В .env не задан GITHUB_PAT"
+    target_chat_id = str(chat_id or next(iter(AUTHORIZED_CHAT_IDS)))
+    secrets_to_set = {
+        "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
+        "BOT_TOKEN": TELEGRAM_BOT_TOKEN,
+        "TELEGRAM_CHAT_ID": target_chat_id,
+        "CHAT_ID": target_chat_id,
+    }
+    async with aiohttp.ClientSession() as session:
+        for s_name, s_val in secrets_to_set.items():
+            ok, msg = await set_repo_actions_secret(session, owner, repo, GITHUB_TOKEN, s_name, s_val)
+            if not ok:
+                return False, msg
+    return True, f"Секреты {', '.join(secrets_to_set.keys())} записаны для chat_id={target_chat_id}"
+
+
 async def trigger_github_workflow(branch: str, notes: str, initiated_by: str) -> tuple[bool, str]:
     if not GITHUB_TOKEN:
         return False, "В .env не задан GITHUB_PAT"
@@ -920,7 +986,7 @@ async def trigger_github_workflow(branch: str, notes: str, initiated_by: str) ->
         "User-Agent": "Telegram-APK-Build-Bot/1.0"
     }
 
-    # 1. Запуск workflow_dispatch для build-apk.yml
+    # 1. Запуск workflow_dispatch для build-apk.yml / build-and-deploy.yml
     url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows/{GITHUB_WORKFLOW}/dispatches"
     payload = {"ref": branch, "inputs": {"notes": f"{notes} ({initiated_by})"}}
 
@@ -1275,11 +1341,18 @@ jobs:
 
       - name: 3B. Прямая доставка в Telegram через Bot API (sendDocument)
         if: \${{ secrets.BOT_WEBHOOK_URL == '' }}
+        env:
+          TELEGRAM_BOT_TOKEN: \${{ secrets.TELEGRAM_BOT_TOKEN }}
+          BOT_TOKEN: \${{ secrets.BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: \${{ secrets.TELEGRAM_CHAT_ID }}
+          CHAT_ID: \${{ secrets.CHAT_ID }}
         run: |
+          TOKEN="\${TELEGRAM_BOT_TOKEN:-\$BOT_TOKEN}"
+          TARGET_CHAT_ID="\${TELEGRAM_CHAT_ID:-\$CHAT_ID}"
           RENAMED_APK="\${{ github.event.repository.name }}_v\${{ github.run_number }}.apk"
           CAPTION="📦 <b>Сборка APK готова!</b>%0A• <b>Проект:</b> <code>\${{ github.event.repository.name }}</code>%0A• <b>Номер сборки:</b> <code>#\${{ github.run_number }}</code> (<code>v\${{ github.run_number }}</code>)%0A• <b>Файл:</b> <code>\${RENAMED_APK}</code>%0A• <b>Ветка:</b> <code>\${{ github.event.client_payload.branch || github.ref_name }}</code>%0A• <b>Автор:</b> \${{ steps.meta.outputs.author }}%0A• <b>Коммит:</b> <code>\${{ steps.meta.outputs.short_sha }}</code> — \${{ steps.meta.outputs.commit_msg }}%0A• <b>Бэкап:</b> <code>\${{ steps.backup.outputs.archive_name }}</code>"
-          curl -sS -X POST "https://api.telegram.org/bot\${{ secrets.TELEGRAM_BOT_TOKEN }}/sendDocument" \\
-            -F "chat_id=\${{ secrets.TELEGRAM_CHAT_ID }}" \\
+          curl -sS -X POST "https://api.telegram.org/bot\${TOKEN}/sendDocument" \\
+            -F "chat_id=\${TARGET_CHAT_ID}" \\
             -F "parse_mode=HTML" \\
             -F "caption=\${CAPTION}" \\
             -F "document=@./\${RENAMED_APK}"
@@ -1793,7 +1866,9 @@ jobs:
         if: success()
         env:
           TELEGRAM_BOT_TOKEN: \${{ secrets.TELEGRAM_BOT_TOKEN }}
+          BOT_TOKEN: \${{ secrets.BOT_TOKEN }}
           TELEGRAM_CHAT_ID: \${{ secrets.TELEGRAM_CHAT_ID }}
+          CHAT_ID: \${{ secrets.CHAT_ID }}
           REPO_NAME: \${{ github.event.repository.name }}
           RUN_NUM: \${{ github.run_number }}
           APK_PATH: \${{ steps.locate_apk.outputs.apk_path }}
@@ -1802,6 +1877,17 @@ jobs:
           AUTHOR: \${{ steps.locate_apk.outputs.author }}
           NOTES: \${{ github.event.inputs.notes || 'Сборка через GitHub Actions' }}
         run: |
+          TOKEN="\${TELEGRAM_BOT_TOKEN:-\$BOT_TOKEN}"
+          TARGET_CHAT_ID="\${TELEGRAM_CHAT_ID:-\$CHAT_ID}"
+          if [ -z "\$TOKEN" ]; then
+            echo "::error::Секрет TELEGRAM_BOT_TOKEN (или BOT_TOKEN) не задан в GitHub Actions Secrets!"
+            exit 1
+          fi
+          if [ -z "\$TARGET_CHAT_ID" ]; then
+            echo "::error::Секрет TELEGRAM_CHAT_ID (или CHAT_ID) не задан в GitHub Actions Secrets!"
+            exit 1
+          fi
+
           RENAMED_APK="\${REPO_NAME}_v\${RUN_NUM}.apk"
           if [ "\$APK_PATH" != "./\$RENAMED_APK" ] && [ -f "\$APK_PATH" ]; then
             cp "\$APK_PATH" "./\$RENAMED_APK"
@@ -1809,8 +1895,8 @@ jobs:
 
           CAPTION="📦 <b>Сборка APK готова!</b>%0A%0A• <b>Проект:</b> <code>\${REPO_NAME}</code>%0A• <b>Номер сборки:</b> <code>#\${RUN_NUM}</code> (<code>v\${RUN_NUM}</code>)%0A• <b>Файл:</b> <code>\${RENAMED_APK}</code>%0A• <b>Ветка:</b> <code>\${{ github.ref_name }}</code>%0A• <b>Коммит:</b> <code>\${SHORT_SHA}</code> — \${COMMIT_MSG}%0A• <b>Автор:</b> \${AUTHOR}%0A• <b>Примечание:</b> \${NOTES}"
 
-          RESPONSE=\$(curl -s -w "\\n%{http_code}" -X POST "https://api.telegram.org/bot\${TELEGRAM_BOT_TOKEN}/sendDocument" \\
-            -F "chat_id=\${TELEGRAM_CHAT_ID}" \\
+          RESPONSE=\$(curl -s -w "\\n%{http_code}" -X POST "https://api.telegram.org/bot\${TOKEN}/sendDocument" \\
+            -F "chat_id=\${TARGET_CHAT_ID}" \\
             -F "parse_mode=HTML" \\
             -F "caption=\${CAPTION}" \\
             -F "document=@./\${RENAMED_APK}")
@@ -1820,7 +1906,7 @@ jobs:
 
           echo "Telegram API Response HTTP code: \$HTTP_CODE"
           if [ "\$HTTP_CODE" -ne 200 ]; then
-            echo "::error::Не удалось отправить файл в Telegram. Ответ: \$BODY"
+            echo "::error::Не удалось отправить файл в Telegram (chat_id=\${TARGET_CHAT_ID}). Ответ: \$BODY"
             exit 1
           else
             echo "APK (\${RENAMED_APK}) успешно отправлен в Telegram!"
